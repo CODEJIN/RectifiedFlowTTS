@@ -1,0 +1,168 @@
+Sound:
+    N_FFT: 2048
+    Num_Mel: 80
+    Hop_Size: 320
+    Sample_Rate: 24000
+    F0_Min: 65  # C2
+    F0_Max: 2094    # C7
+
+Feature_Type: 'Mel' #'Spectrogram', 'Mel'
+
+Tokens: 71
+Languages: 1
+Speakers: 1
+Durations: 4096
+Use_Between_Padding: true
+Audio_Codec_Size: 512
+
+Encoder:
+    Size: 384
+    Transformer:
+        Stack: 6
+        Head: 2
+        Dropout_Rate: 0.1
+        FFN:
+            Kernel_Size: 3
+            Dropout_Rate: 0.1
+        Residual_Conv:
+            Stack: 2
+            Kernel_Size: 5
+            Dropout_Rate: 0.1
+
+Duration_Predictor:
+    Transformer:
+        Stack: 3
+        Head: 2
+        Dropout_Rate: 0.1
+        FFN:
+            Kernel_Size: 3
+            Dropout_Rate: 0.1
+        Residual_Conv:
+            Stack: 2
+            Kernel_Size: 5
+            Dropout_Rate: 0.1
+
+F0_Predictor:
+    Transformer:
+        Stack: 3
+        Head: 2
+        Dropout_Rate: 0.1
+        FFN:
+            Kernel_Size: 3
+            Dropout_Rate: 0.1
+        Residual_Conv:
+            Stack: 2
+            Kernel_Size: 5
+            Dropout_Rate: 0.1
+
+Eliminator:
+    Size: 256
+    Kernel_Size: 3
+
+Frame_Prior_Network:
+    Transformer:
+        Stack: 6
+        Head: 2
+        Dropout_Rate: 0.1
+        FFN:
+            Kernel_Size: 3
+            Dropout_Rate: 0.1
+        Residual_Conv:
+            Stack: 2
+            Kernel_Size: 5
+            Dropout_Rate: 0.1
+
+
+Diffusion:
+    Size: 256
+    Kernel_Size: 5
+    Stack: 20
+    Network_Prediction: 'Flow'   # 'Flow', 'Noise'
+
+
+Token_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Token.yaml'
+Latent_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Latent_Info.yaml'
+Mel_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Mel_Info.yaml'
+F0_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/F0_Info.yaml'
+Speaker_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Speaker_Info.yaml'
+Emotion_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Emotion_Info.yaml'
+Language_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Language_Info.yaml'
+Gender_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Gender_Info.yaml'
+Language_and_Gender_Info_by_Speaker_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Language_and_Gender_Info_by_Speaker.yaml'
+Train:
+    Pattern_Cache: false
+    Train_Pattern:
+        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Train'
+        Metadata_File: 'METADATA.PICKLE'
+        Feature_Length:
+            Min: 50
+            Max: 800
+        Text_Length:
+            Min: 1
+            Max: 200
+        Accumulated_Dataset_Epoch: 1    # This is to prevent slow down from torch.utils.data.DataLoader when the number of patterns is small.
+        Augmentation_Ratio: 0.10
+    Eval_Pattern:
+        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Eval'
+        Metadata_File: 'METADATA.PICKLE'
+        Feature_Length:
+            Min: 50
+            Max: 800
+        Text_Length:
+            Min: 10
+            Max: 200
+    Num_Workers: 2
+    Batch_Size: 12
+    Segment_Size: 64
+    Learning_Rate:
+        Initial: 1.0e-4
+        Decay: 0.999875
+        Decay_Epoch: 1
+    ADAM:
+        Beta1: 0.9
+        Beta2: 0.999
+        Epsilon: 1.0e-7
+    Weight_Decay: 1.0e-6
+    Accumulated_Gradient_Step: 1 # 25    
+    Gradient_Norm: 1.0
+    Discriminator_Lambda: 1.0
+    Max_Step: 300000
+    Discrimination_Step: 0
+    Checkpoint_Save_Interval: 5000
+    Logging_Interval: 1
+    Evaluation_Interval: 1000
+    Inference_Interval: 5000
+    Initial_Inference: true
+    Inference_in_Train:
+        Text: [
+            'Do not kill the goose that lays the golden eggs.',
+            'A good medicine tastes bitter.',
+            'Do not count your chickens before they hatch.',
+            'If you laugh, blessings will come your way.'
+            ]
+        Language: [
+            'English',
+            'English',
+            'English',
+            'English'
+            ]
+
+Inference_Batch_Size: 8
+Inference_Path: './results/Inference'
+Checkpoint_Path: './results/Checkpoint'
+Log_Path: './results/Log'
+
+Weights_and_Biases:
+    Use: false
+    Project: 'RectifiedFlowTTS'
+    Entity: 'codejin'
+    Name: 'Test'
+    Save_Checkpoint:
+        Use: false
+        Interval: 50000 # Unlike local, The capacity of WandB is small.
+
+Use_Mixed_Precision: true
+# Use_Multi_GPU: true
+# Device: '0,1,2,3,4,5,6,7'
+Use_Multi_GPU: false
+Device: '0'

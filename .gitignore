@@ -1,0 +1,10 @@
+*.pyc
+.ipynb_checkpoints
+wandb
+results
+Pattern_Generator_Secret.py
+temp.py
+error_log.txt
+LJ_Load.pickle
+
+hificodec/

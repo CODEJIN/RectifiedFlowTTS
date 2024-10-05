@@ -135,7 +135,7 @@ class Dataset(torch.utils.data.Dataset):
         speaker = self.speaker_dict[pattern_dict['Speaker']]
         language = self.language_dict[pattern_dict['Language']]
         
-        return token, language, pattern_dict['Latent'], pattern_dict['F0'], pattern_dict['Mel'], speaker
+        return token, language, pattern_dict['Latent_Code'], pattern_dict['F0'], pattern_dict['Mel'], speaker
 
     def __len__(self):
         return len(self.patterns)

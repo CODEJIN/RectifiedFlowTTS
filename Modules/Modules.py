@@ -10,7 +10,6 @@ from .Diffusion import Diffusion
 
 from hificodec.vqvae import VQVAE
 
-# TODO: F0 apply
 # TODO: Speech prompt
 
 class RectifiedFlowTTS(torch.nn.Module):
@@ -39,6 +38,7 @@ class RectifiedFlowTTS(torch.nn.Module):
             ckpt_path= './hificodec/HiFi-Codec-24k-320d',
             with_encoder= False
             )
+        self.hificodec.eval()
 
     def forward(
         self,

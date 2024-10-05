@@ -131,8 +131,7 @@ async def Pattern_Generate(
     paths, audios, audio_lengths, f0s = zip(*valid_patterns)
     latent_lengths: List[int] = [length // hop_size for length in audio_lengths]
     audios_tensor = torch.from_numpy(Audio_Stack(audios, max_length= max(audio_lengths))).to(device).float()
-    with torch.inference_mode():        
-
+    with torch.inference_mode():
         latents = hificodec.encode(audios_tensor).permute(0, 2, 1).cpu().numpy() # [Batch, 4, Audio_t / 320]
 
         mels = mel_spectrogram(
@@ -147,21 +146,21 @@ async def Pattern_Generate(
             center= False
             ).cpu().numpy() # [Batch, 80, Audio_t / 320]
 
-    latents: List[np.ndarray] = [
-        latent[:, :length]
-        for latent, length in zip(latents, latent_lengths)
+    latent_codes: List[np.ndarray] = [
+        latent_code[:, :length]
+        for latent_code, length in zip(latent_codes, latent_lengths)
         ]
     mels: List[np.ndarray] = [
         mel[:, :length]
         for mel, length in zip(mels, latent_lengths)
         ]
     
-    latents_trim: List[np.ndarray] = []
+    latent_codes_trim: List[np.ndarray] = []
     mels_trim: List[np.ndarray] = []
     f0s_trim: List[np.ndarray] = []
-    for latent, mel, f0 in zip(latents, mels, f0s):
+    for latent, mel, f0 in zip(latent_codes, mels, f0s):
         if abs(latent.shape[1] - f0.shape[0]) > 1:
-            latents_trim.append(None)
+            latent_codes_trim.append(None)
             mels_trim.append(None)
             f0s_trim.append(None)
             continue
@@ -171,33 +170,33 @@ async def Pattern_Generate(
             latent = np.pad(latent, [[0, 0], [0, f0.shape[0] - latent.shape[1]]], mode= 'edge')
 
         if mel.shape[1] - f0.shape[0] < 0 or mel.shape[1] - f0.shape[0] > 1:
-            latents_trim.append(None)
+            latent_codes_trim.append(None)
             mels_trim.append(None)
             f0s_trim.append(None)
             continue
         else:
             mel = mel[:, :f0.shape[0]]
 
-        latents_trim.append(latent.astype(np.int16))
+        latent_codes_trim.append(latent.astype(np.int16))
         mels_trim.append(mel.astype(np.float16))
         f0s_trim.append(f0.astype(np.float16))
     
-    latents: List[np.ndarray] = []
+    latent_codes: List[np.ndarray] = []
     mels: List[np.ndarray] = []
     f0s: List[np.ndarray] = []
     current_index = 0
     for is_valid in is_valid_list:
         if is_valid:
-            latents.append(latents_trim[current_index])
+            latent_codes.append(latent_codes_trim[current_index])
             mels.append(mels_trim[current_index])
             f0s.append(f0s_trim[current_index])
             current_index += 1
         else:
-            latents.append(None)
+            latent_codes.append(None)
             mels.append(None)
             f0s.append(None)
     
-    return latents, mels, f0s
+    return latent_codes, mels, f0s
 
 def Pattern_File_Generate(
     paths: List[str],
@@ -240,7 +239,7 @@ def Pattern_File_Generate(
         for file, speaker, dataset in zip(files, speakers, datasets)
         ]
 
-    latents, mels, f0s = asyncio.run(Pattern_Generate(
+    latent_codes, mels, f0s = asyncio.run(Pattern_Generate(
         paths= paths,
         num_mels= hp.Sound.Num_Mel,
         sample_rate= hp.Sound.Sample_Rate,
@@ -249,13 +248,13 @@ def Pattern_File_Generate(
         f0_max= hp.Sound.F0_Max
         ))
     
-    for file, latent, mel, f0, speaker, emotion, language, gender, dataset, text, pronunciation in zip(
-        files, latents, mels, f0s, speakers, emotions, languages, genders, datasets, texts, pronunciations
+    for file, latent_code, mel, f0, speaker, emotion, language, gender, dataset, text, pronunciation in zip(
+        files, latent_codes, mels, f0s, speakers, emotions, languages, genders, datasets, texts, pronunciations
         ):
-        if latent is None:
+        if latent_code is None:
             continue
         new_pattern_dict = {
-            'Latent': latent,
+            'Latent_Code': latent_code,
             'Mel': mel,
             'F0': f0,
             'Speaker': speaker,
@@ -1128,10 +1127,10 @@ def Metadata_Generate(eval: bool= False):
             try:
                 if not all([
                     key in pattern_dict.keys()
-                    for key in ('Latent', 'Mel', 'F0', 'Speaker', 'Emotion', 'Language', 'Gender', 'Dataset', 'Text', 'Pronunciation')
+                    for key in ('Latent_Code', 'Mel', 'F0', 'Speaker', 'Emotion', 'Language', 'Gender', 'Dataset', 'Text', 'Pronunciation')
                     ]):
                     continue
-                new_metadata_dict['Latent_Length_Dict'][file] = pattern_dict['Latent'].shape[1]
+                new_metadata_dict['Latent_Length_Dict'][file] = pattern_dict['Latent_Code'].shape[1]
                 new_metadata_dict['Mel_Length_Dict'][file] = pattern_dict['Mel'].shape[1]
                 new_metadata_dict['F0_Length_Dict'][file] = pattern_dict['F0'].shape[0]
                 new_metadata_dict['Speaker_Dict'][file] = pattern_dict['Speaker']

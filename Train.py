@@ -377,7 +377,7 @@ class Trainer:
         flows, prediction_flows, \
         durations, prediction_durations, prediction_f0s, \
         attention_softs, attention_hards, attention_logprobs, \
-        prediction_speakers, alignments = self.model_dict['RectifiedFlowTTS'](
+        prediction_speakers, alignments = self.model_dict['RectifiedFlowTTS_EMA'](
             tokens= tokens,
             token_lengths= token_lengths,
             languages= languages,

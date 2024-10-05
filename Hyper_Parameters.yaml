@@ -6,8 +6,6 @@ Sound:
     F0_Min: 65  # C2
     F0_Max: 2094    # C7
 
-Feature_Type: 'Mel' #'Spectrogram', 'Mel'
-
 Tokens: 71
 Languages: 1
 Speakers: 1

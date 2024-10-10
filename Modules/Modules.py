@@ -80,6 +80,7 @@ class RectifiedFlowTTS(torch.nn.Module):
             encodings= encodings,
             f0s= f0s,
             latents= latents,
+            lengths= latent_code_lengths
             )
 
         return \
@@ -117,7 +118,8 @@ class RectifiedFlowTTS(torch.nn.Module):
         latents = self.diffusion.Inference(
             encodings= encodings,
             f0s= f0s,
-            steps= diffusion_steps
+            steps= diffusion_steps,
+            lengths= latent_code_lengths
             )
 
         # Performing VQ to correct the incomplete predictions of diffusion.

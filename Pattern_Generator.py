@@ -132,7 +132,7 @@ async def Pattern_Generate(
     latent_lengths: List[int] = [length // hop_size for length in audio_lengths]
     audios_tensor = torch.from_numpy(Audio_Stack(audios, max_length= max(audio_lengths))).to(device).float()
     with torch.inference_mode():
-        latents = hificodec.encode(audios_tensor).permute(0, 2, 1).cpu().numpy() # [Batch, 4, Audio_t / 320]
+        latent_codes = hificodec.encode(audios_tensor).permute(0, 2, 1).cpu().numpy() # [Batch, 4, Audio_t / 320]
 
         mels = mel_spectrogram(
             y= audios_tensor,
@@ -1149,7 +1149,7 @@ def Metadata_Generate(eval: bool= False):
                 if not pattern_dict['Speaker'] in f0_dict.keys():
                     f0_dict[pattern_dict['Speaker']] = []
                 
-                latent = hificodec.quantizer.embed(torch.from_numpy(pattern_dict['Latent']).T[None].long().to(device))[0].cpu()
+                latent = hificodec.quantizer.embed(torch.from_numpy(pattern_dict['Latent_Code']).T[None].long().to(device))[0].cpu()
                 latent_dict[pattern_dict['Speaker']]['Min'] = min(latent_dict[pattern_dict['Speaker']]['Min'], latent.min().item())
                 latent_dict[pattern_dict['Speaker']]['Max'] = max(latent_dict[pattern_dict['Speaker']]['Max'], latent.max().item())
                 mel_dict[pattern_dict['Speaker']]['Min'] = min(mel_dict[pattern_dict['Speaker']]['Min'], pattern_dict['Mel'].min().item())

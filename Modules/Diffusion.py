@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Union
 from tqdm import tqdm
 from torchdiffeq import odeint
 
-from .Layer import Conv_Init, Lambda
+from .Layer import Conv_Init, Lambda, FFT_Block, Positional_Encoding
 
 class Diffusion(torch.nn.Module):
     def __init__(
@@ -25,6 +25,7 @@ class Diffusion(torch.nn.Module):
         encodings: torch.FloatTensor,
         f0s: torch.FloatTensor,
         latents: torch.FloatTensor,
+        lengths: torch.IntTensor,
         ):
         '''
         encodings: [Batch, Enc_d, Dec_t]
@@ -43,6 +44,7 @@ class Diffusion(torch.nn.Module):
             noised_latents= noised_latents,
             encodings= encodings,
             f0s= f0s,
+            lengths= lengths,
             diffusion_steps= cosmap_schedule_times[:, 0, 0] # [Batch]
             )
         
@@ -63,6 +65,7 @@ class Diffusion(torch.nn.Module):
         self,
         encodings: torch.FloatTensor,
         f0s: torch.FloatTensor,
+        lengths: torch.IntTensor,
         steps: int
         ):
         noises = torch.randn(
@@ -80,6 +83,7 @@ class Diffusion(torch.nn.Module):
                 noised_latents= noised_latents,
                 encodings= encodings,
                 f0s= f0s,
+                lengths= lengths,
                 diffusion_steps= cosmap_schedule_times[:, 0, 0] # [Batch]
                 )
             
@@ -120,7 +124,35 @@ class Network(torch.nn.Module):
                 ), w_init_gain= 'gelu'),
             torch.nn.GELU(approximate= 'tanh')
             )
+        
+        self.encoding_ffn = torch.nn.Sequential(
+            Conv_Init(torch.nn.Conv1d(
+                in_channels= self.hp.Encoder.Size,
+                out_channels= self.hp.Diffusion.Size * 4,
+                kernel_size= 1,
+                ), w_init_gain= 'gelu'),
+            torch.nn.GELU(approximate= 'tanh'),
+            Conv_Init(torch.nn.Conv1d(
+                in_channels= self.hp.Diffusion.Size * 4,
+                out_channels= self.hp.Diffusion.Size,
+                kernel_size= 1,
+                ), w_init_gain= 'linear')
+            )
 
+        self.f0_ffn = torch.nn.Sequential(
+            Lambda(lambda x: x[:, :, None]),
+            Conv_Init(torch.nn.Linear(
+                in_features= 1,
+                out_features= self.hp.Diffusion.Size * 4,
+                ), w_init_gain= 'gelu'),
+            torch.nn.GELU(approximate= 'tanh'),
+            Conv_Init(torch.nn.Linear(
+                in_features= self.hp.Diffusion.Size * 4,
+                out_features= self.hp.Diffusion.Size,
+                ), w_init_gain= 'linear'),
+            Lambda(lambda x: x.mT)
+            )
+        
         self.step_ffn = torch.nn.Sequential(
             Step_Embedding(
                 embedding_dim= self.hp.Diffusion.Size
@@ -137,15 +169,24 @@ class Network(torch.nn.Module):
             Lambda(lambda x: x[:, :, None])
             )
 
-        self.residual_blocks = torch.nn.ModuleList([
-            Residual_Block(
-                in_channels= self.hp.Diffusion.Size,
-                kernel_size= self.hp.Diffusion.Kernel_Size,
-                encoding_channels= self.hp.Encoder.Size
+        self.positional_encoding = Positional_Encoding(
+            num_embeddings= self.hp.Durations,
+            embedding_dim= self.hp.Diffusion.Size
+            )
+
+        self.blocks: List[FFT_Block] = torch.nn.ModuleList([
+            FFT_Block(
+                channels= self.hp.Diffusion.Size,
+                num_head= self.hp.Diffusion.Transformer.Head,
+                residual_conv_stack= self.hp.Diffusion.Transformer.Residual_Conv.Stack,
+                residual_conv_kernel_size= self.hp.Diffusion.Transformer.Residual_Conv.Kernel_Size,
+                ffn_kernel_size= self.hp.Diffusion.Transformer.FFN.Kernel_Size,
+                residual_conv_dropout_rate= self.hp.Diffusion.Transformer.Residual_Conv.Dropout_Rate,
+                ffn_dropout_rate= self.hp.Diffusion.Transformer.FFN.Dropout_Rate,
                 )
-            for _ in range(self.hp.Diffusion.Stack)
-            ])
-        
+            for _ in range(self.hp.Diffusion.Transformer.Stack)
+            ])  # real type: torch.nn.ModuleList[FFT_BLock]
+
         self.projection = torch.nn.Sequential(
             Conv_Init(torch.nn.Conv1d(
                 in_channels= self.hp.Diffusion.Size,
@@ -164,29 +205,27 @@ class Network(torch.nn.Module):
         noised_latents: torch.Tensor,
         encodings: torch.Tensor,
         f0s: torch.Tensor,
+        lengths: torch.Tensor,
         diffusion_steps: torch.Tensor
         ):
         '''
         noised_latents: [Batch, Latent_d, Dec_t]
-        encodings: [Batch, Latent_d, Dec_t]
+        encodings: [Batch, Enc_d, Dec_t]
         f0s: [Batch, Dec_t]
         diffusion_steps: [Batch]
         '''
         x = self.prenet(noised_latents)
-        f0s = f0s[:, None, :]   # [Batch, 1, Dec_t]
+        encodings = self.encoding_ffn(encodings)
+        f0s = self.f0_ffn(f0s)
         diffusion_steps = self.step_ffn(diffusion_steps) # [Batch, Res_d, 1]
 
-        skips_list = []
-        for residual_block in self.residual_blocks:
-            x, skips = residual_block(
-                x= x,
-                encodings= encodings,
-                f0s= f0s,
-                diffusion_steps= diffusion_steps
-                )
-            skips_list.append(skips)
+        x = x + encodings + f0s + diffusion_steps + self.positional_encoding(
+            position_ids= torch.arange(x.size(2), device= encodings.device)[None]
+            ).mT
 
-        x = torch.stack(skips_list, dim= 0).sum(dim= 0) / math.sqrt(self.hp.Diffusion.Stack)
+        for block in self.blocks:
+            x = block(x, lengths)
+
         x = self.projection(x)
 
         return x
@@ -214,67 +253,6 @@ class Step_Embedding(torch.nn.Module):
         x = torch.cat([x.sin(), x.cos()], dim= 1)
 
         return x
-
-class Residual_Block(torch.nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        kernel_size: int,
-        encoding_channels: int
-        ):
-        super().__init__()
-        self.in_channels = in_channels
-        
-        self.encoding = torch.nn.Conv1d(
-            in_channels= encoding_channels,
-            out_channels= in_channels * 2,
-            kernel_size= 1
-            )
-        self.f0 = torch.nn.Conv1d(
-            in_channels= 1,
-            out_channels= in_channels * 2,
-            kernel_size= 1
-            )
-
-        self.diffusion_step = torch.nn.Conv1d(
-            in_channels= in_channels,
-            out_channels= in_channels,
-            kernel_size= 1
-            )
-
-        self.conv = torch.nn.Conv1d(
-            in_channels= in_channels,
-            out_channels= in_channels * 2,
-            kernel_size= kernel_size,
-            padding= kernel_size // 2
-            )
-
-        self.projection = torch.nn.Conv1d(
-            in_channels= in_channels,
-            out_channels= in_channels * 2,
-            kernel_size= 1
-            )
-
-    def forward(
-        self,
-        x: torch.FloatTensor,
-        encodings: torch.FloatTensor,
-        f0s: torch.FloatTensor,
-        diffusion_steps: torch.FloatTensor
-        ):
-        residuals = x
-
-        encodings = self.encoding(encodings)
-        f0s = self.f0(f0s)
-        diffusion_steps = self.diffusion_step(diffusion_steps)
-
-        x = self.conv(x + diffusion_steps) + encodings + f0s
-        x = Fused_Gate(x)
-
-        x = self.projection(x)
-        x, skips = x.chunk(chunks= 2, dim= 1)
-
-        return (x + residuals) / math.sqrt(2.0), skips
 
 @torch.jit.script
 def Fused_Gate(x):

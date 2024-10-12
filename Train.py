@@ -140,6 +140,7 @@ class Trainer:
         inference_dataset = Inference_Dataset(
             token_dict= token_dict,
             language_dict= language_dict,
+            use_between_padding= self.hp.Use_Between_Padding,
             texts= self.hp.Train.Inference_in_Train.Text,
             languages= self.hp.Train.Inference_in_Train.Language,
             )
@@ -465,12 +466,12 @@ class Trainer:
                 prediction_audios, prediction_f0s, prediction_alignments = inference_func(
                     tokens= tokens[index, None].to(self.device),
                     token_lengths= token_lengths[index, None].to(self.device),
-                    languages= languages[index].to(self.device),
+                    languages= languages[index, None].to(self.device),
                     )
 
             token_length = token_lengths[index].item()
             target_latent_length = latent_code_lengths[index].item()
-            prediction_latent_length = prediction_alignments[0, :token_lengths[index], :].sum().long().item()
+            prediction_latent_length = prediction_alignments[0, :token_length, :].sum().long().item()
             target_audio_length = target_latent_length * self.hp.Sound.Hop_Size
             prediction_audio_length = prediction_latent_length * self.hp.Sound.Hop_Size
 
@@ -561,7 +562,7 @@ class Trainer:
             languages= languages.to(self.device),
             )
         latent_code_lengths = [
-            alignment[:token_length, :].sum().long()
+            alignment[:token_length, :].sum().long().item()
             for token_length, alignment in zip(token_lengths, prediction_alignments)
             ]
         audio_lengths = [
@@ -628,7 +629,7 @@ class Trainer:
                 fontsize = 10
                 )
             plt.title(f'Alignment  {title}')
-            ax = plt.subplot2grid((3, 1), (1, 0))
+            ax = plt.subplot2grid((3, 1), (2, 0))
             plt.plot(audio)
             plt.title('Prediction Audio    {}'.format(title))
             plt.margins(x= 0)

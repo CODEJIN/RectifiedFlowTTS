@@ -1,9 +1,10 @@
 import torch
-import numpy as np
-import logging, yaml, os, sys, argparse, math
+import logging, yaml, sys, math
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from librosa import griffinlim
+from accelerate import Accelerator
+from typing import List
+
 
 from Modules.Modules import RectifiedFlowTTS
 from Datasets import Inference_Dataset as Dataset, Inference_Collater as Collater
@@ -35,126 +36,97 @@ class Inferencer:
             Loader=yaml.Loader
             ))
 
-        self.model = RectifiedFlowTTS(self.hp).to(self.device)
-        if self.hp.Feature_Type == 'Mel':
-            self.vocoder = torch.jit.load('vocoder.pts', map_location='cpu').to(self.device)
-            # self.vocoder = torch.jit.load('universal_0250.pts', map_location='cpu').to(self.device)
+        self.accelerator = Accelerator(
+            split_batches= True,
+            mixed_precision= 'fp16' if self.hp.Use_Mixed_Precision else 'no',   # no, fp16, bf16, fp8
+            gradient_accumulation_steps= self.hp.Train.Accumulated_Gradient_Step
+            )
 
-        if self.hp.Feature_Type == 'Spectrogram':
-            self.feature_range_info_dict = yaml.load(open(self.hp.Spectrogram_Range_Info_Path), Loader=yaml.Loader)
-        if self.hp.Feature_Type == 'Mel':
-            self.feature_range_info_dict = yaml.load(open(self.hp.Mel_Range_Info_Path), Loader=yaml.Loader)
-        self.index_singer_dict = {
-            value: key
-            for key, value in yaml.load(open(self.hp.Singer_Info_Path), Loader=yaml.Loader).items()
-            }
-
-        if self.hp.Feature_Type == 'Spectrogram':
-            self.feature_size = self.hp.Sound.N_FFT // 2 + 1
-        elif self.hp.Feature_Type == 'Mel':
-            self.feature_size = self.hp.Sound.Num_Mel
-        else:
-            raise ValueError('Unknown feature type: {}'.format(self.hp.Feature_Type))
+        self.model = torch.optim.swa_utils.AveragedModel(RectifiedFlowTTS(self.hp).to(self.device))
+        self.model.Inference = self.model.module.Inference
+        self.accelerator.prepare(self.model)
 
         self.Load_Checkpoint(checkpoint_path)
         self.batch_size = batch_size
 
-    def Dataset_Generate(self, message_times_list, lyrics, notes, singers, genres):
-        token_dict = yaml.load(open(self.hp.Token_Path), Loader=yaml.Loader)
-        singer_info_dict = yaml.load(open(self.hp.Singer_Info_Path), Loader=yaml.Loader)
-        genre_info_dict = yaml.load(open(self.hp.Genre_Info_Path), Loader=yaml.Loader)
+    def Dataset_Generate(
+        self,
+        texts: List[str],
+        languages: List[str],
+        ):
+        token_dict = yaml.load(open(self.hp.Token_Path, encoding= 'utf-8-sig'), Loader=yaml.Loader)
+        language_dict = yaml.load(open(self.hp.Language_Info_Path, encoding= 'utf-8-sig'), Loader=yaml.Loader)
+
+        dataset = Dataset(
+            token_dict= token_dict,
+            language_dict= language_dict,
+            use_between_padding= self.hp.Use_Between_Padding,
+            texts= texts,
+            languages= languages,
+            )
+        collater = Collater(
+            token_dict= token_dict
+            )
 
         return torch.utils.data.DataLoader(
-            dataset= Dataset(
-                token_dict= token_dict,
-                singer_info_dict= singer_info_dict,
-                genre_info_dict= genre_info_dict,
-                durations= message_times_list,
-                lyrics= lyrics,
-                notes= notes,
-                singers= singers,
-                genres= genres,
-                sample_rate= self.hp.Sound.Sample_Rate,
-                Hop_Size= self.hp.Sound.Hop_Size,
-                equality_duration= self.hp.Duration.Equality,
-                consonant_duration= self.hp.Duration.Consonant_Duration
-                ),
-            shuffle= False,
-            collate_fn= Collater(
-                token_dict= token_dict
-                ),
+            dataset= dataset,
+            sampler= torch.utils.data.SequentialSampler(dataset),
+            collate_fn= collater,
             batch_size= self.batch_size,
-            num_workers= 0,
+            num_workers= self.hp.Train.Num_Workers,
             pin_memory= True
             )
 
     def Load_Checkpoint(self, path):
-        state_dict = torch.load(path, map_location= 'cpu')
-        self.model.load_state_dict(state_dict['Model']['DiffSinger'])        
-        self.steps = state_dict['Steps']
-
-        self.model.eval()
-
-        logging.info('Checkpoint loaded at {} steps.'.format(self.steps))
+        state_dict = torch.load(f'{path}/pytorch_model_1.bin', map_location= 'cpu')
+        self.model.load_state_dict(state_dict)
+        
+        logging.info(f'Checkpoint loaded from \'{path}\'.')
 
     @torch.inference_mode()
-    def Inference_Step(self, tokens, notes, durations, lengths, singers, genres, singer_labels, ddim_steps):
-        tokens = tokens.to(self.device, non_blocking=True)
-        notes = notes.to(self.device, non_blocking=True)
-        durations = durations.to(self.device, non_blocking=True)
-        lengths = lengths.to(self.device, non_blocking=True)
-        singers = singers.to(self.device, non_blocking=True)
-        genres = genres.to(self.device, non_blocking=True)
-        
-        linear_predictions, diffusion_predictions, _, _ = self.model(
-            tokens= tokens,
-            notes= notes,
-            durations= durations,
-            lengths= lengths,
-            genres= genres,
-            singers= singers,
-            ddim_steps= ddim_steps
+    def Inference_Step(
+        self,
+        tokens: torch.IntTensor,
+        token_lengths: torch.IntTensor,
+        languages: torch.IntTensor
+        ):
+        prediction_audios, _, prediction_alignments = self.model.Inference(
+            tokens= tokens.to(self.device),
+            token_lengths= token_lengths.to(self.device),
+            languages= languages.to(self.device),
             )
-        linear_predictions = linear_predictions.clamp(-1.0, 1.0)
-        diffusion_predictions = diffusion_predictions.clamp(-1.0, 1.0)
-
-        linear_prediction_list, diffusion_prediction_list = [], []
-        for linear_prediction, diffusion_prediction, singer in zip(linear_predictions, diffusion_predictions, singer_labels):
-            feature_max = self.feature_range_info_dict[singer]['Max']
-            feature_min = self.feature_range_info_dict[singer]['Min']
-            linear_prediction_list.append((linear_prediction + 1.0) / 2.0 * (feature_max - feature_min) + feature_min)
-            diffusion_prediction_list.append((diffusion_prediction + 1.0) / 2.0 * (feature_max - feature_min) + feature_min)
-        linear_predictions = torch.stack(linear_prediction_list, dim= 0)
-        diffusion_predictions = torch.stack(diffusion_prediction_list, dim= 0)
         
-        if self.hp.Feature_Type == 'Mel':
-            audios = self.vocoder(diffusion_predictions)
-            if audios.ndim == 1:    # This is temporal because of the vocoder problem.
-                audios = audios.unsqueeze(0)
-            audios = [
-                audio[:min(length * self.hp.Sound.Hop_Size, audio.size(0))].cpu().numpy()
-                for audio, length in zip(audios, lengths)
-                ]
-        elif self.hp.Feature_Type == 'Spectrogram':
-            audios = []
-            for prediction, length in zip(
-                diffusion_predictions,
-                lengths
-                ):
-                prediction = spectral_de_normalize_torch(prediction).cpu().numpy()
-                audio = griffinlim(prediction)[:min(prediction.size(1), length) * self.hp.Sound.Hop_Size]
-                audio = (audio / np.abs(audio).max() * 32767.5).astype(np.int16)
-                audios.append(audio)
+        latent_code_lengths = [
+            alignment[:token_length, :].sum().long().item()
+            for token_length, alignment in zip(token_lengths, prediction_alignments)
+            ]
+        audio_lengths = [
+            length * self.hp.Sound.Hop_Size
+            for length in latent_code_lengths
+            ]
 
-        return audios
+        prediction_audios = [
+            audio[:length]
+            for audio, length in zip(prediction_audios.clamp(-1.0, 1.0).cpu().numpy(), audio_lengths)
+            ]
+        
+        print(token_lengths)
+        print(latent_code_lengths)
+        print(audio_lengths)
+        print(prediction_alignments.shape)
+        print(prediction_alignments[0])
 
-    def Inference_Epoch(self, message_times_list, lyrics, notes, singers, genres, ddim_steps, use_tqdm= True):
+        return prediction_audios
+
+    def Inference_Epoch(
+        self,
+        texts: List[str],
+        languages: List[str],
+        use_tqdm= True
+        ):
         dataloader = self.Dataset_Generate(
-            message_times_list= message_times_list,
-            lyrics= lyrics,
-            notes= notes,
-            singers= singers,
-            genres= genres
+            texts= texts,
+            languages= languages
             )
         if use_tqdm:
             dataloader = tqdm(
@@ -163,7 +135,37 @@ class Inferencer:
                 total= math.ceil(len(dataloader.dataset) / self.batch_size)
                 )
         audios = []
-        for tokens, notes, durations, lengths, singers, genres, singer_labels, lyrics in dataloader:
-            audios.extend(self.Inference_Step(tokens, notes, durations, lengths, singers, genres, singer_labels, ddim_steps))
+        for tokens, token_lengths, languages, _, _ in dataloader:
+            audios.extend(self.Inference_Step(tokens, token_lengths, languages))
         
         return audios
+    
+if __name__ == '__main__':
+    inferencer = Inferencer(
+        hp_path= './results/Checkpoint/Hyper_Parameters.yaml',
+        checkpoint_path= './results/Checkpoint/S_166424',
+        batch_size= 4
+        )
+    
+    audios = inferencer.Inference_Epoch(
+        texts= [
+            'Printing, in the only sense with which we are at present concerned, differs from most if not from all the arts and crafts represented in the Exhibition',
+            'Do not kill the goose that lays the golden eggs.',
+            'A good medicine tastes bitter.',
+            'Do not count your chickens before they hatch.',
+            'If you laugh, blessings will come your way.'
+            ],
+        languages= [
+            'English',
+            'English',
+            'English',
+            'English',
+            'English'
+            ]
+        )
+    
+    from scipy.io import wavfile
+    for index, audio in enumerate(audios):
+        wavfile.write(
+            f'{index}.wav', inferencer.hp.Sound.Sample_Rate, audio
+            )

@@ -60,7 +60,7 @@ class Dataset(torch.utils.data.Dataset):
         self,
         token_dict: Dict[str, int],
         language_dict: Dict[str, Dict[str, float]],
-        speaker_dict: Dict[str, Dict[str, float]],        
+        speaker_dict: Dict[str, Dict[str, float]],
         use_between_padding: bool,
         pattern_path: str,
         metadata_file: str,
@@ -145,16 +145,18 @@ class Inference_Dataset(torch.utils.data.Dataset):
         self,
         token_dict: Dict[str, int],
         language_dict: Dict[str, Dict[str, float]],
+        use_between_padding: bool,
         texts: List[str],
         languages: List[str],
         ):
         super().__init__()
         self.token_dict = token_dict
         self.language_dict = language_dict
+        self.use_between_padding = use_between_padding
 
         pronunciations = [
             English_Phoneme_Split(pronunciation)
-            for pronunciation in Phonemize(texts, language= Language.English)
+            for pronunciation in Phonemize([x.upper().strip() for x in texts], language= Language.English)
             ]
         
         self.patterns = list(zip(pronunciations, languages, texts))
@@ -162,7 +164,14 @@ class Inference_Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         pronunciation, language, text = self.patterns[idx]
 
-        return Text_to_Token(pronunciation, self.token_dict), self.language_dict[language], text, pronunciation
+        if self.use_between_padding:
+            token = ['<P>'] * (len(pronunciation) * 2 - 1)
+            token[0::2] = pronunciation
+        else:
+            token = pronunciation
+        token = Text_to_Token(token, self.token_dict)
+
+        return token, self.language_dict[language], text, pronunciation
 
     def __len__(self):
         return len(self.patterns)

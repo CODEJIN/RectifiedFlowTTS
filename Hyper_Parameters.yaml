@@ -72,9 +72,18 @@ Frame_Prior_Network:
 
 
 Diffusion:
-    Size: 256
-    Kernel_Size: 5
-    Stack: 20
+    Size: 512
+    Transformer:
+        Stack: 6
+        Head: 2
+        Dropout_Rate: 0.1
+        FFN:
+            Kernel_Size: 3
+            Dropout_Rate: 0.1
+        Residual_Conv:
+            Stack: 2
+            Kernel_Size: 5
+            Dropout_Rate: 0.1
     Network_Prediction: 'Flow'   # 'Flow', 'Noise'
 
 

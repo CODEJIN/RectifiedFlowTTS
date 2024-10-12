@@ -26,7 +26,7 @@ class RectifiedFlowTTS(torch.nn.Module):
 
 
         self.duration_predictor = Duration_Predictor(self.hp)
-        self.F0_predictor = F0_Predictor(self.hp)
+        self.f0_predictor = F0_Predictor(self.hp)
         self.speaker_eliminator = Eliminator(self.hp, self.hp.Speakers)
 
         self.frame_prior_network = Frame_Prior_Network(self.hp)
@@ -74,12 +74,13 @@ class RectifiedFlowTTS(torch.nn.Module):
         encodings = encodings @ alignments  # [Batch, Enc_d, Dec_t]
         
         encodings = self.frame_prior_network(encodings, latent_code_lengths) # [Batch, Enc_d, Dec_t]
-        prediction_f0s = self.F0_predictor(encodings, latent_code_lengths)   # [Batch, Dec_t]
+        prediction_f0s = self.f0_predictor(encodings, latent_code_lengths)   # [Batch, Dec_t]
 
         flows, prediction_flows, _, _ = self.diffusion(
             encodings= encodings,
             f0s= f0s,
             latents= latents,
+            lengths= latent_code_lengths
             )
 
         return \
@@ -101,7 +102,7 @@ class RectifiedFlowTTS(torch.nn.Module):
             lengths= token_lengths,
             )    # [Batch, Enc_d, Enc_t]
 
-        durations = self.duration_predictor(encodings, token_lengths)   # [Batch, Enc_t]
+        durations = self.duration_predictor(encodings, token_lengths).ceil().long()   # [Batch, Enc_t]
         alignments = self.Length_Regulate(durations)
 
         encodings = encodings @ alignments  # [Batch, Enc_d, Dec_t]
@@ -112,11 +113,12 @@ class RectifiedFlowTTS(torch.nn.Module):
             ])
 
         encodings = self.frame_prior_network(encodings, latent_code_lengths) # [Batch, Enc_d, Dec_t]
-        f0s = self.F0_predictor(encodings, latent_code_lengths)   # [Batch, Dec_t]
+        f0s = self.f0_predictor(encodings, latent_code_lengths)   # [Batch, Dec_t]
 
         latents = self.diffusion.Inference(
             encodings= encodings,
             f0s= f0s,
+            lengths= latent_code_lengths,
             steps= diffusion_steps
             )
 

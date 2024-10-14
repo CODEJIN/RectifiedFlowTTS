@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Union
 from tqdm import tqdm
 from torchdiffeq import odeint
 
-from .Layer import Conv_Init, Lambda, FFT_Block, Positional_Encoding
+from .Layer import Conv_Init, Lambda, FFT_Block, Prompt_Block, Positional_Encoding
 
 class Diffusion(torch.nn.Module):
     def __init__(
@@ -26,6 +26,8 @@ class Diffusion(torch.nn.Module):
         f0s: torch.FloatTensor,
         latents: torch.FloatTensor,
         lengths: torch.IntTensor,
+        prompts: torch.FloatTensor,
+        prompt_lengths: torch.IntTensor
         ):
         '''
         encodings: [Batch, Enc_d, Dec_t]
@@ -45,6 +47,8 @@ class Diffusion(torch.nn.Module):
             encodings= encodings,
             f0s= f0s,
             lengths= lengths,
+            prompts= prompts,
+            prompt_lengths= prompt_lengths,
             diffusion_steps= cosmap_schedule_times[:, 0, 0] # [Batch]
             )
         
@@ -66,6 +70,8 @@ class Diffusion(torch.nn.Module):
         encodings: torch.FloatTensor,
         f0s: torch.FloatTensor,
         lengths: torch.IntTensor,
+        prompts: torch.FloatTensor,
+        prompt_lengths: torch.IntTensor,
         steps: int
         ):
         noises = torch.randn(
@@ -84,6 +90,8 @@ class Diffusion(torch.nn.Module):
                 encodings= encodings,
                 f0s= f0s,
                 lengths= lengths,
+                prompts= prompts,
+                prompt_lengths= prompt_lengths,
                 diffusion_steps= cosmap_schedule_times[:, 0, 0] # [Batch]
                 )
             
@@ -169,10 +177,39 @@ class Network(torch.nn.Module):
             Lambda(lambda x: x[:, :, None])
             )
 
+        self.prompt_ffn = torch.nn.Sequential(
+            Conv_Init(torch.nn.Conv1d(
+                in_channels= self.hp.Encoder.Size,
+                out_channels= self.hp.Diffusion.Size * 4,
+                kernel_size= 1,
+                ), w_init_gain= 'gelu'),
+            torch.nn.GELU(approximate= 'tanh'),
+            Conv_Init(torch.nn.Conv1d(
+                in_channels= self.hp.Diffusion.Size * 4,
+                out_channels= self.hp.Diffusion.Size,
+                kernel_size= 1,
+                ), w_init_gain= 'linear')
+            )
+
+        
+
         self.positional_encoding = Positional_Encoding(
             num_embeddings= self.hp.Durations,
             embedding_dim= self.hp.Diffusion.Size
             )
+
+        self.prompt_blocks: List[Prompt_Block] = torch.nn.ModuleList([
+            Prompt_Block(
+                channels= self.hp.Diffusion.Size,
+                num_head= self.hp.Diffusion.Transformer.Head,
+                residual_conv_stack= self.hp.Diffusion.Transformer.Residual_Conv.Stack,
+                residual_conv_kernel_size= self.hp.Diffusion.Transformer.Residual_Conv.Kernel_Size,
+                ffn_kernel_size= self.hp.Diffusion.Transformer.FFN.Kernel_Size,
+                residual_conv_dropout_rate= self.hp.Diffusion.Transformer.Residual_Conv.Dropout_Rate,
+                ffn_dropout_rate= self.hp.Diffusion.Transformer.FFN.Dropout_Rate,
+                )
+            for _ in range(self.hp.Diffusion.Transformer.Stack)
+            ])  # real type: torch.nn.ModuleList[FFT_BLock]
 
         self.blocks: List[FFT_Block] = torch.nn.ModuleList([
             FFT_Block(
@@ -205,7 +242,9 @@ class Network(torch.nn.Module):
         noised_latents: torch.Tensor,
         encodings: torch.Tensor,
         f0s: torch.Tensor,
-        lengths: torch.Tensor,
+        lengths: torch.Tensor,        
+        prompts: torch.FloatTensor,
+        prompt_lengths: torch.IntTensor,
         diffusion_steps: torch.Tensor
         ):
         '''
@@ -217,13 +256,20 @@ class Network(torch.nn.Module):
         x = self.prenet(noised_latents)
         encodings = self.encoding_ffn(encodings)
         f0s = self.f0_ffn(f0s)
+        prompts = self.prompt_ffn(prompts)
         diffusion_steps = self.step_ffn(diffusion_steps) # [Batch, Res_d, 1]
 
         x = x + encodings + f0s + diffusion_steps + self.positional_encoding(
             position_ids= torch.arange(x.size(2), device= encodings.device)[None]
             ).mT
 
-        for block in self.blocks:
+        for block, prompt_block in zip(self.blocks, self.prompt_blocks):
+            x = prompt_block(
+                x= x,
+                prompts= prompts,
+                lengths= lengths,
+                prompt_lengths= prompt_lengths
+                )
             x = block(x, lengths)
 
         x = self.projection(x)

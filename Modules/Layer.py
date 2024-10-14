@@ -314,6 +314,55 @@ class FFN(torch.nn.Module):
 
         return x
 
+class Prompt_Block(FFT_Block):
+    def forward(
+        self,
+        x: torch.FloatTensor,
+        prompts: torch.FloatTensor,
+        lengths: Optional[torch.Tensor]= None,
+        prompt_lengths: Optional[torch.Tensor]= None
+        ) -> torch.Tensor:
+        '''
+        x: [B, X_c, X_t]
+        lengths: [B]
+
+        '''
+        masks = None
+        float_masks = 1.0
+        if not lengths is None:
+            masks = Mask_Generate(lengths= lengths, max_length= torch.ones_like(x[0, 0]).sum())    # [Batch, Time]
+            float_masks = (~masks).unsqueeze(1).float()   # float mask, [Batch, 1, X_t]
+
+        prompt_masks = None
+        prompt_float_masks = 1.0
+        if not lengths is None:
+            prompt_masks = Mask_Generate(lengths= prompt_lengths, max_length= torch.ones_like(prompts[0, 0]).sum())    # [Batch, Time]
+            prompt_float_masks = (~prompt_masks).unsqueeze(1).float()   # float mask, [Batch, 1, X_t]
+
+        residuals = x_attentions = x.permute(2,0,1).contiguous()
+        prompts = prompts.permute(2, 0, 1).contiguous()
+        x_attentions, _ = self.attention(
+            query= x_attentions,
+            key= prompts,
+            value= prompts,
+            key_padding_mask= prompt_masks
+            )
+        x_attentions = self.attention_norm(x_attentions + residuals).permute(1, 2, 0) * float_masks
+
+        # conv block
+        x_convs = x
+        for block in self.residual_conv_blocks:
+            x_convs = block(x_convs, float_masks)
+        
+        residuals = x = self.norm((x_attentions + x_convs).mT).mT * float_masks
+        
+        # feed forward
+        x = self.ffn(x, float_masks)
+        
+        return x    # [B, X_c, X_t]
+
+
+
 class RotaryPositionalEncoding(torch.nn.Module):
     def __init__(self, channels: int):
         super().__init__()

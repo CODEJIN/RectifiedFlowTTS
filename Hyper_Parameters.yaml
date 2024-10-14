@@ -8,13 +8,26 @@ Sound:
 
 Tokens: 71
 Languages: 1
-Speakers: 1
+Speakers: 109
 Durations: 4096
 Use_Between_Padding: true
 Audio_Codec_Size: 512
 
 Encoder:
     Size: 384
+    Transformer:
+        Stack: 6
+        Head: 2
+        Dropout_Rate: 0.1
+        FFN:
+            Kernel_Size: 3
+            Dropout_Rate: 0.1
+        Residual_Conv:
+            Stack: 2
+            Kernel_Size: 5
+            Dropout_Rate: 0.1
+
+Prompter:
     Transformer:
         Stack: 6
         Head: 2
@@ -87,19 +100,19 @@ Diffusion:
     Network_Prediction: 'Flow'   # 'Flow', 'Noise'
 
 
-Token_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Token.yaml'
-Latent_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Latent_Info.yaml'
-Mel_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Mel_Info.yaml'
-F0_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/F0_Info.yaml'
-Speaker_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Speaker_Info.yaml'
-Emotion_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Emotion_Info.yaml'
-Language_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Language_Info.yaml'
-Gender_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Gender_Info.yaml'
-Language_and_Gender_Info_by_Speaker_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Language_and_Gender_Info_by_Speaker.yaml'
+Token_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Token.yaml'
+Latent_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Latent_Info.yaml'
+Mel_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Mel_Info.yaml'
+F0_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/F0_Info.yaml'
+Speaker_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Speaker_Info.yaml'
+Emotion_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Emotion_Info.yaml'
+Language_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Language_Info.yaml'
+Gender_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Gender_Info.yaml'
+Language_and_Gender_Info_by_Speaker_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Language_and_Gender_Info_by_Speaker.yaml'
 Train:
     Pattern_Cache: false
     Train_Pattern:
-        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Train'
+        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Train'
         Metadata_File: 'METADATA.PICKLE'
         Feature_Length:
             Min: 50
@@ -108,9 +121,9 @@ Train:
             Min: 1
             Max: 200
         Accumulated_Dataset_Epoch: 1    # This is to prevent slow down from torch.utils.data.DataLoader when the number of patterns is small.
-        Augmentation_Ratio: 0.10
+        Augmentation_Ratio: 0.05
     Eval_Pattern:
-        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.LJ/Eval'
+        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Eval'
         Metadata_File: 'METADATA.PICKLE'
         Feature_Length:
             Min: 50
@@ -146,6 +159,12 @@ Train:
             'A good medicine tastes bitter.',
             'Do not count your chickens before they hatch.',
             'If you laugh, blessings will come your way.'
+            ]
+        Reference: [
+            '/mnt/f/Rawdata/VCTK092/wav48/p225/p225_001_mic1.flac',
+            '/mnt/f/Rawdata/VCTK092/wav48/p264/p264_002_mic1.flac',
+            '/mnt/f/Rawdata/VCTK092/wav48/p271/p271_002_mic2.flac',
+            '/mnt/f/Rawdata/LJSpeech/wavs/LJ032-0206.wav'
             ]
         Language: [
             'English',

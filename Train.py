@@ -17,6 +17,7 @@ from typing import List
 from Modules.Modules import RectifiedFlowTTS, Mask_Generate
 from Modules.Nvidia_Alignment_Learning_Framework import AttentionBinarizationLoss, AttentionCTCLoss
 from Datasets import Dataset, Inference_Dataset, Collater, Inference_Collater
+from hificodec.vqvae import VQVAE
 
 from meldataset import mel_spectrogram
 from Arg_Parser import Recursive_Parse, To_Non_Recursive_Dict
@@ -51,6 +52,11 @@ class Trainer:
             open(self.hp_path, encoding='utf-8'),
             Loader=yaml.Loader
             ))
+        self.hificodec = VQVAE(
+            config_path= './hificodec/config_24k_320d.json',
+            ckpt_path= './hificodec/HiFi-Codec-24k-320d',
+            with_encoder= True
+            )
 
         self.accelerator = Accelerator(
             split_batches= True,
@@ -140,8 +146,12 @@ class Trainer:
         inference_dataset = Inference_Dataset(
             token_dict= token_dict,
             language_dict= language_dict,
+            codec= self.hificodec,
+            hop_size= self.hp.Sound.Hop_Size,
+            sample_rate= self.hp.Sound.Sample_Rate,
             use_between_padding= self.hp.Use_Between_Padding,
             texts= self.hp.Train.Inference_in_Train.Text,
+            reference_paths= self.hp.Train.Inference_in_Train.Reference,
             languages= self.hp.Train.Inference_in_Train.Language,
             )
 
@@ -185,7 +195,7 @@ class Trainer:
 
     def Model_Generate(self):
         self.model_dict = {
-            'RectifiedFlowTTS': RectifiedFlowTTS(self.hp).to(self.device)
+            'RectifiedFlowTTS': RectifiedFlowTTS(self.hp, self.hificodec).to(self.device)
             }
         self.model_dict['RectifiedFlowTTS_EMA'] = torch.optim.swa_utils.AveragedModel(
             self.model_dict['RectifiedFlowTTS'],
@@ -235,6 +245,8 @@ class Trainer:
         self,
         tokens: torch.IntTensor,
         token_lengths: torch.IntTensor,
+        reference_latent_codes: torch.IntTensor,
+        reference_latent_code_lengths: torch.IntTensor,
         languages: torch.IntTensor,
         latent_codes: torch.IntTensor,
         latent_code_lengths: torch.IntTensor,
@@ -252,6 +264,8 @@ class Trainer:
             prediction_speakers, _ = self.model_dict['RectifiedFlowTTS'](
                 tokens= tokens,
                 token_lengths= token_lengths,
+                reference_latent_codes= reference_latent_codes,
+                reference_latent_code_lengths= reference_latent_code_lengths,
                 languages= languages,
                 latent_codes= latent_codes,
                 latent_code_lengths= latent_code_lengths,
@@ -314,10 +328,13 @@ class Trainer:
             self.scalar_dict['Train']['Loss/{}'.format(tag)] += loss.item()
 
     def Train_Epoch(self):
-        for tokens, token_lengths, languages, latent_codes, latent_code_lengths, f0s, mels, speakers, attention_priors in self.dataloader_dict['Train']:
+        for tokens, token_lengths, reference_latent_codes, reference_latent_code_lengths, languages, \
+            latent_codes, latent_code_lengths, f0s, mels, speakers, attention_priors in self.dataloader_dict['Train']:
             self.Train_Step(
                 tokens= tokens,
                 token_lengths= token_lengths,
+                reference_latent_codes= reference_latent_codes,
+                reference_latent_code_lengths= reference_latent_code_lengths,
                 languages= languages,
                 latent_codes= latent_codes,
                 latent_code_lengths= latent_code_lengths,
@@ -365,6 +382,8 @@ class Trainer:
         self,
         tokens: torch.IntTensor,
         token_lengths: torch.IntTensor,
+        reference_latent_codes: torch.IntTensor,
+        reference_latent_code_lengths: torch.IntTensor,
         languages: torch.IntTensor,
         latent_codes: torch.IntTensor,
         latent_code_lengths: torch.IntTensor,
@@ -381,6 +400,8 @@ class Trainer:
         prediction_speakers, alignments = self.model_dict['RectifiedFlowTTS_EMA'](
             tokens= tokens,
             token_lengths= token_lengths,
+            reference_latent_codes= reference_latent_codes,
+            reference_latent_code_lengths= reference_latent_code_lengths,
             languages= languages,
             latent_codes= latent_codes,
             latent_code_lengths= latent_code_lengths,
@@ -428,7 +449,8 @@ class Trainer:
         for model in self.model_dict.values():
             model.eval()
 
-        for step, (tokens, token_lengths, languages, latent_codes, latent_code_lengths, f0s, mels, speakers, attention_priors) in tqdm(
+        for step, (tokens, token_lengths, reference_latent_codes, reference_latent_code_lengths, languages,
+            latent_codes, latent_code_lengths, f0s, mels, speakers, attention_priors) in tqdm(
             enumerate(self.dataloader_dict['Eval'], 1),
             desc='[Evaluation]',
             total= math.ceil(len(self.dataloader_dict['Eval'].dataset) / self.hp.Train.Batch_Size / self.num_gpus)
@@ -436,6 +458,8 @@ class Trainer:
             alignments = self.Evaluation_Step(
                 tokens= tokens,
                 token_lengths= token_lengths,
+                reference_latent_codes= reference_latent_codes,
+                reference_latent_code_lengths= reference_latent_code_lengths,
                 languages= languages,
                 latent_codes= latent_codes,
                 latent_code_lengths= latent_code_lengths,
@@ -466,6 +490,8 @@ class Trainer:
                 prediction_audios, prediction_f0s, prediction_alignments = inference_func(
                     tokens= tokens[index, None].to(self.device),
                     token_lengths= token_lengths[index, None].to(self.device),
+                    reference_latent_codes= reference_latent_codes[index, None].to(self.device),
+                    reference_latent_code_lengths= reference_latent_code_lengths[index, None].to(self.device),
                     languages= languages[index, None].to(self.device),
                     )
 
@@ -545,6 +571,8 @@ class Trainer:
         self,
         tokens: torch.IntTensor,
         token_lengths: torch.IntTensor,
+        reference_latent_codes: torch.IntTensor,
+        reference_latent_code_lengths: torch.IntTensor,
         languages: torch.IntTensor,
         texts: List[str],
         pronunciations: List[str],
@@ -557,9 +585,11 @@ class Trainer:
             inference_func = self.model_dict['RectifiedFlowTTS_EMA'].Inference
 
         prediction_audios, prediction_f0s, prediction_alignments = inference_func(
-            tokens= tokens.to(self.device),
-            token_lengths= token_lengths.to(self.device),
-            languages= languages.to(self.device),
+            tokens= tokens,
+            token_lengths= token_lengths,
+            reference_latent_codes= reference_latent_codes,
+            reference_latent_code_lengths= reference_latent_code_lengths,
+            languages= languages,
             )
         latent_code_lengths = [
             alignment[:token_length, :].sum().long().item()
@@ -654,7 +684,7 @@ class Trainer:
             model.eval()
 
         batch_size = self.hp.Inference_Batch_Size or self.hp.Train.Batch_Size
-        for step, (tokens, token_lengths, languages, texts, pronunciations) in tqdm(
+        for step, (tokens, token_lengths, reference_latent_codes, reference_latent_code_lengths, languages, texts, pronunciations) in tqdm(
             enumerate(self.dataloader_dict['Inference']),
             desc='[Inference]',
             total= math.ceil(len(self.dataloader_dict['Inference'].dataset) / batch_size)
@@ -662,6 +692,8 @@ class Trainer:
             self.Inference_Step(
                 tokens= tokens,
                 token_lengths= token_lengths,
+                reference_latent_codes= reference_latent_codes,
+                reference_latent_code_lengths= reference_latent_code_lengths,
                 languages= languages,
                 texts= texts,
                 pronunciations= pronunciations,

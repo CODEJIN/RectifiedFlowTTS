@@ -4,7 +4,7 @@ import math
 from typing import Union, List, Optional
 
 from .Nvidia_Alignment_Learning_Framework import Alignment_Learning_Framework
-from .Layer import Conv_Init, Embedding_Initialize_, FFT_Block, Lambda, Positional_Encoding
+from .Layer import Conv_Init, Embedding_Initialize_, FFT_Block, Prompt_Block, Positional_Encoding
 from .GRL import GRL
 from .Diffusion import Diffusion
 
@@ -13,7 +13,11 @@ from hificodec.vqvae import VQVAE
 # TODO: Speech prompt
 
 class RectifiedFlowTTS(torch.nn.Module):
-    def __init__(self, hyper_parameters: Namespace):
+    def __init__(
+        self,
+        hyper_parameters: Namespace,
+        hificodec: VQVAE
+        ):
         super().__init__()
         self.hp = hyper_parameters
 
@@ -23,7 +27,8 @@ class RectifiedFlowTTS(torch.nn.Module):
             feature_size= self.hp.Sound.Num_Mel,
             encoding_size= self.hp.Encoder.Size
             )
-
+        
+        self.prompt_encoder = Prompt_Encoder(self.hp)
 
         self.duration_predictor = Duration_Predictor(self.hp)
         self.f0_predictor = F0_Predictor(self.hp)
@@ -33,17 +38,15 @@ class RectifiedFlowTTS(torch.nn.Module):
 
         self.diffusion = Diffusion(self.hp)
 
-        self.hificodec = VQVAE(
-            config_path= './hificodec/config_24k_320d.json',
-            ckpt_path= './hificodec/HiFi-Codec-24k-320d',
-            with_encoder= False
-            )
+        self.hificodec = hificodec
         self.hificodec.eval()
 
     def forward(
         self,
         tokens: torch.LongTensor,
         token_lengths: torch.LongTensor,
+        reference_latent_codes: torch.LongTensor,
+        reference_latent_code_lengths: torch.LongTensor,
         languages: torch.LongTensor,
         latent_codes: torch.LongTensor,
         latent_code_lengths: torch.LongTensor,
@@ -52,13 +55,19 @@ class RectifiedFlowTTS(torch.nn.Module):
         attention_priors: torch.FloatTensor
         ):
         with torch.no_grad():
-            latents = self.hificodec.quantizer.embed(latent_codes.mT)
-            
-        encodings = self.encoder(
+            latents = self.hificodec.quantizer.embed(latent_codes.mT).detach()
+            reference_latents = self.hificodec.quantizer.embed(reference_latent_codes.mT).detach()
+
+        prompts = self.prompt_encoder(
+            latents= reference_latents,
+            lengths= reference_latent_code_lengths,
+            )    # [Batch, Enc_d, Prompt_t]
+        encodings = self.encoder.forward(
             tokens= tokens,
             languages= languages,
             lengths= token_lengths,
-            )    # [Batch, Enc_d, Enc_t]
+            )    # [Batch, Enc_d, Enc_t]        
+        
         
         durations, attention_softs, attention_hards, attention_logprobs = self.alignment_learning_framework(
             token_embeddings= self.encoder.token_embedding(tokens).permute(0, 2, 1),
@@ -67,20 +76,32 @@ class RectifiedFlowTTS(torch.nn.Module):
             feature_lengths= latent_code_lengths,
             attention_priors= attention_priors
             )
-        prediction_durations = self.duration_predictor(encodings, token_lengths)   # [Batch, Enc_t]
+        prediction_durations = self.duration_predictor(
+            encodings= encodings,
+            lengths= token_lengths,
+            prompts= prompts,
+            prompt_lengths= reference_latent_code_lengths
+            )   # [Batch, Enc_t]
         prediction_speakers = self.speaker_eliminator(encodings)
         
         alignments = self.Length_Regulate(durations)
         encodings = encodings @ alignments  # [Batch, Enc_d, Dec_t]
         
         encodings = self.frame_prior_network(encodings, latent_code_lengths) # [Batch, Enc_d, Dec_t]
-        prediction_f0s = self.f0_predictor(encodings, latent_code_lengths)   # [Batch, Dec_t]
+        prediction_f0s = self.f0_predictor(
+            encodings= encodings,
+            lengths= latent_code_lengths,
+            prompts= prompts,
+            prompt_lengths= reference_latent_code_lengths
+            )   # [Batch, Dec_t]
 
         flows, prediction_flows, _, _ = self.diffusion(
             encodings= encodings,
             f0s= f0s,
             latents= latents,
-            lengths= latent_code_lengths
+            lengths= latent_code_lengths,
+            prompts= prompts,
+            prompt_lengths= reference_latent_code_lengths
             )
 
         return \
@@ -93,16 +114,30 @@ class RectifiedFlowTTS(torch.nn.Module):
         self,
         tokens: torch.LongTensor,
         token_lengths: torch.LongTensor,
+        reference_latent_codes: torch.LongTensor,
+        reference_latent_code_lengths: torch.LongTensor,
         languages: torch.LongTensor,
         diffusion_steps: int= 16
-        ):  
+        ):
+        with torch.no_grad():
+            reference_latents = self.hificodec.quantizer.embed(reference_latent_codes.mT).detach()
+
+        prompts = self.prompt_encoder(
+            latents= reference_latents,
+            lengths= reference_latent_code_lengths,
+            )    # [Batch, Enc_d, Prompt_t]
         encodings = self.encoder(
             tokens= tokens,
             languages= languages,
             lengths= token_lengths,
             )    # [Batch, Enc_d, Enc_t]
 
-        durations = self.duration_predictor(encodings, token_lengths).ceil().long()   # [Batch, Enc_t]
+        durations = self.duration_predictor(
+            encodings= encodings,
+            lengths= token_lengths,
+            prompts= prompts,
+            prompt_lengths= reference_latent_code_lengths
+            ).ceil().long()   # [Batch, Enc_t]
         alignments = self.Length_Regulate(durations)
 
         encodings = encodings @ alignments  # [Batch, Enc_d, Dec_t]
@@ -113,13 +148,20 @@ class RectifiedFlowTTS(torch.nn.Module):
             ])
 
         encodings = self.frame_prior_network(encodings, latent_code_lengths) # [Batch, Enc_d, Dec_t]
-        f0s = self.f0_predictor(encodings, latent_code_lengths)   # [Batch, Dec_t]
+        f0s = self.f0_predictor(
+            encodings= encodings,
+            lengths= latent_code_lengths,
+            prompts= prompts,
+            prompt_lengths= reference_latent_code_lengths
+            )   # [Batch, Dec_t]
 
         latents = self.diffusion.Inference(
             encodings= encodings,
             f0s= f0s,
             lengths= latent_code_lengths,
-            steps= diffusion_steps
+            steps= diffusion_steps,
+            prompts= prompts,
+            prompt_lengths= reference_latent_code_lengths
             )
 
         # Performing VQ to correct the incomplete predictions of diffusion.
@@ -187,13 +229,13 @@ class Encoder(torch.nn.Module):
                 )
             for _ in range(self.hp.Encoder.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
-        
+
     def forward(
         self,
-        tokens: torch.Tensor,
-        languages: torch.Tensor,
-        lengths: torch.Tensor,
-        ) -> torch.Tensor:
+        tokens: torch.FloatTensor,
+        languages: torch.LongTensor,
+        lengths: torch.LongTensor
+        ) -> torch.FloatTensor:
         '''
         tokens: [Batch, Enc_t]
         languages: [Batch] or [Batch, Enc_t]
@@ -208,13 +250,66 @@ class Encoder(torch.nn.Module):
 
         encodings = encodings + self.positional_encoding(
             position_ids= torch.arange(encodings.size(1), device= encodings.device)[None]
-            )
+            )        
+        encodings = encodings.mT # [Batch, Enc_d, Enc_t]        
         
-        encodings = encodings.mT # [Batch, Enc_d, Enc_t]
         for block in self.blocks:
             encodings = block(encodings, lengths)
-        
+            
         return encodings
+
+class Prompt_Encoder(torch.nn.Module):
+    def __init__(
+        self,
+        hyper_parameters: Namespace,
+        ):
+        super().__init__()
+        self.hp = hyper_parameters
+ 
+        self.prenet = Conv_Init(torch.nn.Conv1d(
+            in_channels= self.hp.Audio_Codec_Size,
+            out_channels= self.hp.Encoder.Size,
+            kernel_size= 1
+            ), w_init_gain= 'gelu')
+        self.gelu = torch.nn.GELU(approximate= 'tanh')
+
+        self.positional_encoding = Positional_Encoding(
+            num_embeddings= self.hp.Durations,
+            embedding_dim= self.hp.Encoder.Size
+            )
+        
+        self.blocks: List[FFT_Block] = torch.nn.ModuleList([
+            FFT_Block(
+                channels= self.hp.Encoder.Size,
+                num_head= self.hp.Prompter.Transformer.Head,
+                residual_conv_stack= self.hp.Prompter.Transformer.Residual_Conv.Stack,
+                residual_conv_kernel_size= self.hp.Prompter.Transformer.Residual_Conv.Kernel_Size,
+                ffn_kernel_size= self.hp.Prompter.Transformer.FFN.Kernel_Size,
+                residual_conv_dropout_rate= self.hp.Prompter.Transformer.Residual_Conv.Dropout_Rate,
+                ffn_dropout_rate= self.hp.Prompter.Transformer.FFN.Dropout_Rate,
+                )
+            for _ in range(self.hp.Prompter.Transformer.Stack)
+            ])  # real type: torch.nn.ModuleList[FFT_BLock]
+    
+    def forward(
+        self,
+        latents: torch.Tensor,
+        lengths: torch.Tensor,
+        ) -> torch.Tensor:
+        '''
+        encodings: [Batch, Enc_d, Enc_t]        
+        lengths: [Batch], token length
+        '''
+        latents = self.prenet(latents)
+        latents = self.gelu(latents)
+        latents = latents + self.positional_encoding(
+            position_ids= torch.arange(latents.size(2), device= latents.device)[None]
+            ).mT    # using detach.
+
+        for block in self.blocks:
+            latents = block(latents, lengths)
+
+        return latents
 
 class Duration_Predictor(torch.nn.Module):
     def __init__(
@@ -228,7 +323,20 @@ class Duration_Predictor(torch.nn.Module):
             num_embeddings= self.hp.Durations,
             embedding_dim= self.hp.Encoder.Size
             )
-        
+
+        self.prompt_blocks: List[Prompt_Block] = torch.nn.ModuleList([
+            Prompt_Block(
+                channels= self.hp.Encoder.Size,
+                num_head= self.hp.Duration_Predictor.Transformer.Head,
+                residual_conv_stack= self.hp.Duration_Predictor.Transformer.Residual_Conv.Stack,
+                residual_conv_kernel_size= self.hp.Duration_Predictor.Transformer.Residual_Conv.Kernel_Size,
+                ffn_kernel_size= self.hp.Duration_Predictor.Transformer.FFN.Kernel_Size,
+                residual_conv_dropout_rate= self.hp.Duration_Predictor.Transformer.Residual_Conv.Dropout_Rate,
+                ffn_dropout_rate= self.hp.Duration_Predictor.Transformer.FFN.Dropout_Rate,
+                )
+            for _ in range(self.hp.Duration_Predictor.Transformer.Stack)
+            ])  # real type: torch.nn.ModuleList[FFT_BLock]
+
         self.blocks: List[FFT_Block] = torch.nn.ModuleList([
             FFT_Block(
                 channels= self.hp.Encoder.Size,
@@ -241,7 +349,7 @@ class Duration_Predictor(torch.nn.Module):
                 )
             for _ in range(self.hp.Duration_Predictor.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
-        
+
         self.projection = Conv_Init(torch.nn.Conv1d(
             in_channels= self.hp.Encoder.Size,
             out_channels= 1,
@@ -252,6 +360,8 @@ class Duration_Predictor(torch.nn.Module):
         self,
         encodings: torch.Tensor,
         lengths: torch.Tensor,
+        prompts: torch.FloatTensor,
+        prompt_lengths: torch.IntTensor
         ) -> torch.Tensor:
         '''
         encodings: [Batch, Enc_d, Enc_t]        
@@ -260,8 +370,17 @@ class Duration_Predictor(torch.nn.Module):
         encodings = encodings.detach() + self.positional_encoding(
             position_ids= torch.arange(encodings.size(2), device= encodings.device)[None]
             ).mT    # using detach.
+        prompts = prompts + self.positional_encoding(
+            position_ids= torch.arange(prompts.size(2), device= prompts.device)[None]
+            ).mT
 
-        for block in self.blocks:
+        for block, prompt_block in zip(self.blocks, self.prompt_blocks):
+            encodings = prompt_block(
+                x= encodings,
+                prompts= prompts,
+                lengths= lengths,
+                prompt_lengths= prompt_lengths
+                )
             encodings = block(encodings, lengths)
 
         durations = self.projection(encodings)[:, 0, :] # [Batch, Enc_t]
@@ -280,7 +399,20 @@ class F0_Predictor(torch.nn.Module):
             num_embeddings= self.hp.Durations,
             embedding_dim= self.hp.Encoder.Size
             )
-        
+
+        self.prompt_blocks: List[Prompt_Block] = torch.nn.ModuleList([
+            Prompt_Block(
+                channels= self.hp.Encoder.Size,
+                num_head= self.hp.F0_Predictor.Transformer.Head,
+                residual_conv_stack= self.hp.F0_Predictor.Transformer.Residual_Conv.Stack,
+                residual_conv_kernel_size= self.hp.F0_Predictor.Transformer.Residual_Conv.Kernel_Size,
+                ffn_kernel_size= self.hp.F0_Predictor.Transformer.FFN.Kernel_Size,
+                residual_conv_dropout_rate= self.hp.F0_Predictor.Transformer.Residual_Conv.Dropout_Rate,
+                ffn_dropout_rate= self.hp.F0_Predictor.Transformer.FFN.Dropout_Rate,
+                )
+            for _ in range(self.hp.F0_Predictor.Transformer.Stack)
+            ])  # real type: torch.nn.ModuleList[FFT_BLock]
+
         self.blocks: List[FFT_Block] = torch.nn.ModuleList([
             FFT_Block(
                 channels= self.hp.Encoder.Size,
@@ -304,6 +436,8 @@ class F0_Predictor(torch.nn.Module):
         self,
         encodings: torch.Tensor,
         lengths: torch.Tensor,
+        prompts: torch.FloatTensor,
+        prompt_lengths: torch.IntTensor
         ) -> torch.Tensor:
         '''
         encodings: [Batch, Enc_d, Dec_t]        
@@ -312,11 +446,20 @@ class F0_Predictor(torch.nn.Module):
         encodings = encodings.detach() + self.positional_encoding(
             position_ids= torch.arange(encodings.size(2), device= encodings.device)[None]
             ).mT    # using detach.
+        prompts = prompts + self.positional_encoding(
+            position_ids= torch.arange(prompts.size(2), device= prompts.device)[None]
+            ).mT
 
-        for block in self.blocks:
+        for block, prompt_block in zip(self.blocks, self.prompt_blocks):
+            encodings = prompt_block(
+                x= encodings,
+                prompts= prompts,
+                lengths= lengths,
+                prompt_lengths= prompt_lengths
+                )
             encodings = block(encodings, lengths)
 
-        f0s = self.projection(encodings)[:, 0, :] # [Batch, Enc_t]
+        f0s = self.projection(encodings)[:, 0, :] # [Batch, Dec_t]
 
         return torch.nn.functional.softplus(f0s)
 
@@ -416,8 +559,6 @@ class Frame_Prior_Network(torch.nn.Module):
             encodings = block(encodings, lengths)
         
         return encodings
-
-
 
 
 def Mask_Generate(lengths: torch.Tensor, max_length: Union[torch.Tensor, int, None]= None):

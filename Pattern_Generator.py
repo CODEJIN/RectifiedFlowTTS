@@ -132,7 +132,7 @@ async def Pattern_Generate(
     latent_lengths: List[int] = [length // hop_size for length in audio_lengths]
     audios_tensor = torch.from_numpy(Audio_Stack(audios, max_length= max(audio_lengths))).to(device).float()
     with torch.inference_mode():
-        latents = hificodec.encode(audios_tensor).permute(0, 2, 1).cpu().numpy() # [Batch, 4, Audio_t / 320]
+        latent_codes = hificodec.encode(audios_tensor).permute(0, 2, 1).cpu().numpy() # [Batch, 4, Audio_t / 320]
 
         mels = mel_spectrogram(
             y= audios_tensor,
@@ -712,7 +712,10 @@ def VCTK_Info_Load(path: str):
         texts= [text_dict[path] for path in paths],
         language= Language.English
         )    
-    pronunciation_dict = {path: pronunciation for path, pronunciation in zip(paths, pronunciations)}
+    pronunciation_dict = {
+        path: English_Phoneme_Split(pronunciation)
+        for path, pronunciation in zip(paths, pronunciations)
+        }
 
     speaker_dict = {
         path: 'VCTK.{}'.format(path.split('/')[-2].strip().upper())
@@ -909,9 +912,11 @@ def Libri_Info_Load(path: str, n_sample_by_speaker: Optional[int]= None):
     pronunciations = Phonemize(
         texts= [text_dict[path] for path in paths],
         language= Language.English
-        )    
-    pronunciation_dict = {path: pronunciation for path, pronunciation in zip(paths, pronunciations)}
-
+        )
+    pronunciation_dict = {
+        path: English_Phoneme_Split(pronunciation)
+        for path, pronunciation in zip(paths, pronunciations)
+        }
     emotion_dict = {path: 'Neutral' for path in paths}
     language_dict = {path: 'English' for path in paths}
 
@@ -1043,9 +1048,9 @@ def MLS_Info_Load(path: str, n_sample_by_speaker: Optional[int]= None):
     pronunciations = Phonemize(
         texts= texts,
         language= Language.English
-        )    
+        )
     pronunciation_dict = {
-        path: pronunciation
+        path: English_Phoneme_Split(pronunciation)
         for path, pronunciation in zip(paths, pronunciations)
         }
 
@@ -1086,7 +1091,7 @@ def Split_Eval(paths: List[str], eval_ratio: float= 0.001, min_eval: int= 1):
 @torch.inference_mode()
 def Metadata_Generate(eval: bool= False):
     pattern_path = hp.Train.Eval_Pattern.Path if eval else hp.Train.Train_Pattern.Path
-    metadata_File = hp.Train.Eval_Pattern.Metadata_File if eval else hp.Train.Train_Pattern.Metadata_File
+    metadata_file = hp.Train.Eval_Pattern.Metadata_File if eval else hp.Train.Train_Pattern.Metadata_File
 
     latent_dict = {}
     mel_dict = {}
@@ -1119,57 +1124,51 @@ def Metadata_Generate(eval: bool= False):
 
     for root, _, files in os.walk(pattern_path, followlinks=True):
         for file in files:
+            if file in [hp.Train.Eval_Pattern.Metadata_File, hp.Train.Train_Pattern.Metadata_File]:
+                continue
             with open(os.path.join(root, file).replace("\\", "/"), "rb") as f:
                 pattern_dict = pickle.load(f)
 
             file = os.path.join(root, file).replace("\\", "/").replace(pattern_path, '').lstrip('/')
 
-            try:
-                if not all([
-                    key in pattern_dict.keys()
-                    for key in ('Latent_Code', 'Mel', 'F0', 'Speaker', 'Emotion', 'Language', 'Gender', 'Dataset', 'Text', 'Pronunciation')
-                    ]):
-                    continue
-                new_metadata_dict['Latent_Length_Dict'][file] = pattern_dict['Latent_Code'].shape[1]
-                new_metadata_dict['Mel_Length_Dict'][file] = pattern_dict['Mel'].shape[1]
-                new_metadata_dict['F0_Length_Dict'][file] = pattern_dict['F0'].shape[0]
-                new_metadata_dict['Speaker_Dict'][file] = pattern_dict['Speaker']
-                new_metadata_dict['Emotion_Dict'][file] = pattern_dict['Emotion']
-                new_metadata_dict['Dataset_Dict'][file] = pattern_dict['Dataset']
-                new_metadata_dict['File_List'].append(file)
-                if not pattern_dict['Speaker'] in new_metadata_dict['File_List_by_Speaker_Dict'].keys():
-                    new_metadata_dict['File_List_by_Speaker_Dict'][pattern_dict['Speaker']] = []
-                new_metadata_dict['File_List_by_Speaker_Dict'][pattern_dict['Speaker']].append(file)
-                new_metadata_dict['Text_Length_Dict'][file] = len(pattern_dict['Text'])
+            new_metadata_dict['Latent_Length_Dict'][file] = pattern_dict['Latent_Code'].shape[1]
+            new_metadata_dict['Mel_Length_Dict'][file] = pattern_dict['Mel'].shape[1]
+            new_metadata_dict['F0_Length_Dict'][file] = pattern_dict['F0'].shape[0]
+            new_metadata_dict['Speaker_Dict'][file] = pattern_dict['Speaker']
+            new_metadata_dict['Emotion_Dict'][file] = pattern_dict['Emotion']
+            new_metadata_dict['Dataset_Dict'][file] = pattern_dict['Dataset']
+            new_metadata_dict['File_List'].append(file)
+            if not pattern_dict['Speaker'] in new_metadata_dict['File_List_by_Speaker_Dict'].keys():
+                new_metadata_dict['File_List_by_Speaker_Dict'][pattern_dict['Speaker']] = []
+            new_metadata_dict['File_List_by_Speaker_Dict'][pattern_dict['Speaker']].append(file)
+            new_metadata_dict['Text_Length_Dict'][file] = len(pattern_dict['Text'])
 
-                if not pattern_dict['Speaker'] in latent_dict.keys():
-                    latent_dict[pattern_dict['Speaker']] = {'Min': math.inf, 'Max': -math.inf}
-                if not pattern_dict['Speaker'] in mel_dict.keys():
-                    mel_dict[pattern_dict['Speaker']] = {'Min': math.inf, 'Max': -math.inf}
-                if not pattern_dict['Speaker'] in f0_dict.keys():
-                    f0_dict[pattern_dict['Speaker']] = []
-                
-                latent = hificodec.quantizer.embed(torch.from_numpy(pattern_dict['Latent']).T[None].long().to(device))[0].cpu()
-                latent_dict[pattern_dict['Speaker']]['Min'] = min(latent_dict[pattern_dict['Speaker']]['Min'], latent.min().item())
-                latent_dict[pattern_dict['Speaker']]['Max'] = max(latent_dict[pattern_dict['Speaker']]['Max'], latent.max().item())
-                mel_dict[pattern_dict['Speaker']]['Min'] = min(mel_dict[pattern_dict['Speaker']]['Min'], pattern_dict['Mel'].min().item())
-                mel_dict[pattern_dict['Speaker']]['Max'] = max(mel_dict[pattern_dict['Speaker']]['Max'], pattern_dict['Mel'].max().item())
+            if not pattern_dict['Speaker'] in latent_dict.keys():
+                latent_dict[pattern_dict['Speaker']] = {'Min': math.inf, 'Max': -math.inf}
+            if not pattern_dict['Speaker'] in mel_dict.keys():
+                mel_dict[pattern_dict['Speaker']] = {'Min': math.inf, 'Max': -math.inf}
+            if not pattern_dict['Speaker'] in f0_dict.keys():
+                f0_dict[pattern_dict['Speaker']] = []
+            
+            latent = hificodec.quantizer.embed(torch.from_numpy(pattern_dict['Latent_Code']).T[None].long().to(device))[0].cpu()
+            latent_dict[pattern_dict['Speaker']]['Min'] = min(latent_dict[pattern_dict['Speaker']]['Min'], latent.min().item())
+            latent_dict[pattern_dict['Speaker']]['Max'] = max(latent_dict[pattern_dict['Speaker']]['Max'], latent.max().item())
+            mel_dict[pattern_dict['Speaker']]['Min'] = min(mel_dict[pattern_dict['Speaker']]['Min'], pattern_dict['Mel'].min().item())
+            mel_dict[pattern_dict['Speaker']]['Max'] = max(mel_dict[pattern_dict['Speaker']]['Max'], pattern_dict['Mel'].max().item())
 
-                f0_dict[pattern_dict['Speaker']].append(pattern_dict['F0'])
-                speakers.append(pattern_dict['Speaker'])
-                emotions.append(pattern_dict['Emotion'])
-                languages.append(pattern_dict['Language'])
-                genders.append(pattern_dict['Gender'])
-                language_and_gender_dict_by_speaker[pattern_dict['Speaker']] = {
-                    'Language': pattern_dict['Language'],
-                    'Gender': pattern_dict['Gender']
-                    }
-            except:
-                print(f'File \'{file}\' is not correct pattern file. This file is ignored.')
+            f0_dict[pattern_dict['Speaker']].append(pattern_dict['F0'])
+            speakers.append(pattern_dict['Speaker'])
+            emotions.append(pattern_dict['Emotion'])
+            languages.append(pattern_dict['Language'])
+            genders.append(pattern_dict['Gender'])
+            language_and_gender_dict_by_speaker[pattern_dict['Speaker']] = {
+                'Language': pattern_dict['Language'],
+                'Gender': pattern_dict['Gender']
+                }
 
             files_tqdm.update(1)
 
-    with open(os.path.join(pattern_path, metadata_File.upper()).replace("\\", "/"), 'wb') as f:
+    with open(os.path.join(pattern_path, metadata_file).replace("\\", "/"), 'wb') as f:
         pickle.dump(new_metadata_dict, f, protocol= 4)
 
     if not eval:
@@ -1445,7 +1444,7 @@ if __name__ == '__main__':
     Metadata_Generate(eval= True)
 
 # python Pattern_Generator.py -hp Hyper_Parameters.yaml -lj /mnt/f/Rawdata/LJSpeech
-# python Pattern_Generator.py -hp Hyper_Parameters.yaml -vctk D:\Rawdata\VCTK092
+# python Pattern_Generator.py -hp Hyper_Parameters.yaml -lj /mnt/f/Rawdata/LJSpeech -vctk /mnt/f/Rawdata/VCTK092
 # python Pattern_Generator.py -hp Hyper_Parameters.yaml -mls D:\Rawdata\mls_english_opus
 # python Pattern_Generator.py -hp Hyper_Parameters.yaml -libri D:\Rawdata\LibriTTS
 # python Pattern_Generator.py -hp Hyper_Parameters.yaml -aihub "E:/014.다화자 음성합성 데이터/01.데이터/2.Validation" -sample 100

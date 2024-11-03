@@ -868,11 +868,28 @@ def Libri_Info_Load(path: str, n_sample_by_speaker: Optional[int]= None):
         print(f'Libri info generated: {len(paths)}')
         return paths, text_dict, pronunciation_dict, speaker_dict, emotion_dict, language_dict, gender_dict
 
+    bad_sample_paths = [
+        os.path.join(path, 'libritts_r_failed_speech_restoration_examples', file).replace('\\', '/')
+        for file in os.listdir(os.path.join(path, 'libritts_r_failed_speech_restoration_examples').replace('\\', '/'))
+        if 'bad_sample_list' in file
+        ]
+    if len(bad_sample_paths) == 0:
+        logging.warning('There is no bad sample list file. If using LibriTTS-R, please check the bad sample problem.')
+    bad_samples = [
+        os.path.join(path, file.strip()[2:]).replace('\\', '/')
+        for bad_sample_path in bad_sample_paths
+        for file in open(bad_sample_path, 'r').readlines()
+        ]
+
     paths = []
     for root, _, files in os.walk(path):
         for file in files:
             file_path = os.path.join(root, file).replace('\\', '/')
             if not os.path.splitext(file_path)[1].upper() in using_extension:
+                continue
+            elif file_path in bad_samples:
+                continue
+            elif not os.path.exists(f'{os.path.splitext(file_path)[0]}.normalized.txt'):
                 continue
             paths.append(file_path)
 
@@ -940,6 +957,7 @@ def Libri_Info_Load(path: str, n_sample_by_speaker: Optional[int]= None):
             'Language_Dict': language_dict,
             'Gender_Dict': gender_dict
             }, f, protocol= 4)
+
     return paths, text_dict, pronunciation_dict, speaker_dict, emotion_dict, language_dict, gender_dict
 
 def LJ_Info_Load(path: str):
@@ -1449,3 +1467,4 @@ if __name__ == '__main__':
 # python Pattern_Generator.py -hp Hyper_Parameters.yaml -libri D:\Rawdata\LibriTTS
 # python Pattern_Generator.py -hp Hyper_Parameters.yaml -aihub "E:/014.다화자 음성합성 데이터/01.데이터/2.Validation" -sample 100
 # python Pattern_Generator.py -hp Hyper_Parameters.yaml -selvas D:/Rawdata/Selvas
+# python Pattern_Generator.py -hp Hyper_Parameters.yaml -libri /mnt/f/Rawdata/LibriTTS-R

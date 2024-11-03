@@ -725,10 +725,7 @@ class Trainer:
         if self.accelerator.is_main_process:
             logging.info('Checkpoint loaded at {} steps.'.format(self.steps))
 
-    def Save_Checkpoint(self):        
-        if not self.accelerator.is_main_process:
-            return
-        
+    def Save_Checkpoint(self):
         os.makedirs(self.hp.Checkpoint_Path, exist_ok= True)
         checkpoint_path = os.path.join(self.hp.Checkpoint_Path, 'S_{}'.format(self.steps).replace('\\', '/'))
 

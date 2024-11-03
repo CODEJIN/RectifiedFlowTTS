@@ -100,19 +100,19 @@ Diffusion:
     Network_Prediction: 'Flow'   # 'Flow', 'Noise'
 
 
-Token_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Token.yaml'
-Latent_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Latent_Info.yaml'
-Mel_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Mel_Info.yaml'
-F0_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/F0_Info.yaml'
-Speaker_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Speaker_Info.yaml'
-Emotion_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Emotion_Info.yaml'
-Language_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Language_Info.yaml'
-Gender_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Gender_Info.yaml'
-Language_and_Gender_Info_by_Speaker_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Language_and_Gender_Info_by_Speaker.yaml'
+Token_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Token.yaml'
+Latent_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Latent_Info.yaml'
+Mel_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Mel_Info.yaml'
+F0_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/F0_Info.yaml'
+Speaker_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Speaker_Info.yaml'
+Emotion_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Emotion_Info.yaml'
+Language_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Language_Info.yaml'
+Gender_Info_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Gender_Info.yaml'
+Language_and_Gender_Info_by_Speaker_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Language_and_Gender_Info_by_Speaker.yaml'
 Train:
     Pattern_Cache: false
     Train_Pattern:
-        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Train'
+        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Train'
         Metadata_File: 'METADATA.PICKLE'
         Feature_Length:
             Min: 50
@@ -123,7 +123,7 @@ Train:
         Accumulated_Dataset_Epoch: 1    # This is to prevent slow down from torch.utils.data.DataLoader when the number of patterns is small.
         Augmentation_Ratio: 0.05
     Eval_Pattern:
-        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Eval'
+        Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.Libri/Eval'
         Metadata_File: 'METADATA.PICKLE'
         Feature_Length:
             Min: 50

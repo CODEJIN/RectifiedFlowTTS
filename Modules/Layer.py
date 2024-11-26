@@ -74,11 +74,11 @@ class Conditional_LayerNorm(torch.nn.LayerNorm):
         ) -> torch.FloatTensor:
         '''
         x: [Batch, Time, X_d],
-        conditions: [Batch, Time, Cond_d]
+        conditions: [Batch, Time or 1, Cond_d]
         '''
         x = super().forward(x)  # [Batch, Time, X_d]
 
-        gammas, betas = self.affine(conditions).chunk(chunks= 2, dim= 2)    # [Batch, Time, X_d] * 2
+        gammas, betas = self.affine(conditions).chunk(chunks= 2, dim= 2)    # [Batch, Time or 1, X_d] * 2
         x = gammas * x + betas
 
         return x
@@ -254,10 +254,7 @@ class FFT_Block(torch.nn.Module):
         self,
         channels: int,
         num_head: int,        
-        residual_conv_stack: int,
-        residual_conv_kernel_size: int,        
         ffn_kernel_size: int,
-        residual_conv_dropout_rate: float= 0.1,
         ffn_dropout_rate: float= 0.1,
         norm_type: Norm_Type= Norm_Type.LayerNorm,
         condition_channels: Optional[float]= None,
@@ -265,52 +262,72 @@ class FFT_Block(torch.nn.Module):
         ) -> None:
         super().__init__()
         self.norm_type = norm_type
+        self.use_condition = not condition_channels is None
+        if all([
+            not self.use_condition,
+            norm_type in [Norm_Type.Conditional_LayerNorm, Norm_Type.Mixed_LayerNorm]
+            ]):
+            raise ValueError('CLN or MLN only can be used with condition.')
 
-        self.attention = MultiHeadAttentionWithRoPE(
+        self.self_attention = MultiHeadAttentionWithRoPE(
             embed_dim= channels,
             num_heads= num_head
             )
-
+        
         if norm_type == Norm_Type.LayerNorm:
-            self.attention_norm = torch.nn.LayerNorm(channels)
+            self.residual_norm = torch.nn.LayerNorm(channels)
         elif norm_type == Norm_Type.Conditional_LayerNorm:
-            self.attention_norm = Conditional_LayerNorm(
+            self.residual_norm = Conditional_LayerNorm(
                 channels= channels,
                 condition_channels= condition_channels
                 )
         elif norm_type == Norm_Type.Mixed_LayerNorm:
-            self.attention_norm = Mixed_LayerNorm(
-                channels= channels,
-                condition_channels= condition_channels,
-                beta_distribution_concentration= beta_distribution_concentration
-                )
-        
-        self.residual_conv_blocks = torch.nn.ModuleList([
-            FFN(
-                channels= channels,
-                kernel_size= residual_conv_kernel_size,
-                droput_rate= residual_conv_dropout_rate,
-                norm_type= norm_type,
-                condition_channels= condition_channels,
-                beta_distribution_concentration= beta_distribution_concentration
-                )
-            for _ in range(residual_conv_stack)
-            ])
-        
-        if norm_type == Norm_Type.LayerNorm:
-            self.norm = torch.nn.LayerNorm(channels)
-        elif norm_type == Norm_Type.Conditional_LayerNorm:
-            self.norm = Conditional_LayerNorm(
-                channels= channels,
-                condition_channels= condition_channels
-                )
-        elif norm_type == Norm_Type.Mixed_LayerNorm:
-            self.norm = Mixed_LayerNorm(
+            self.residual_norm = Mixed_LayerNorm(
                 channels= channels,
                 condition_channels= condition_channels,
                 beta_distribution_concentration= beta_distribution_concentration
                 )
 
+        if self.use_condition:
+            self.global_condition_prenet = Conv_Init(torch.nn.Linear(
+                in_features= condition_channels,
+                out_features= condition_channels,
+                bias= False
+                ), w_init_gain= 'gelu')
+            self.gelu = torch.nn.GELU(approximate= 'tanh')        
+            self.global_condition_norm = torch.nn.LayerNorm(condition_channels)
+        
+            self.cross_attention = MultiHeadAttentionWithRoPE(
+                embed_dim= channels,
+                num_heads= num_head,
+                k_dim= condition_channels,
+                v_dim= condition_channels
+                )
+
+            if norm_type == Norm_Type.LayerNorm:
+                self.self_attention_norm = torch.nn.LayerNorm(channels)
+                self.cross_attention_norm = torch.nn.LayerNorm(channels)
+            elif norm_type == Norm_Type.Conditional_LayerNorm:
+                self.self_attention_norm = Conditional_LayerNorm(
+                    channels= channels,
+                    condition_channels= condition_channels
+                    )
+                self.cross_attention_norm = Conditional_LayerNorm(
+                    channels= channels,
+                    condition_channels= condition_channels
+                    )
+            elif norm_type == Norm_Type.Mixed_LayerNorm:
+                self.self_attention_norm = Mixed_LayerNorm(
+                    channels= channels,
+                    condition_channels= condition_channels,
+                    beta_distribution_concentration= beta_distribution_concentration
+                    )
+                self.cross_attention_norm = Mixed_LayerNorm(
+                    channels= channels,
+                    condition_channels= condition_channels,
+                    beta_distribution_concentration= beta_distribution_concentration
+                    )
+        
         self.ffn = FFN(
             channels= channels,
             kernel_size= ffn_kernel_size,
@@ -323,8 +340,9 @@ class FFT_Block(torch.nn.Module):
     def forward(
         self,
         x: torch.FloatTensor,
-        conditions: Optional[torch.FloatTensor]= None,
         lengths: Optional[torch.FloatTensor]= None,
+        conditions: Optional[torch.FloatTensor]= None,
+        condition_lengths: Optional[torch.FloatTensor]= None,
         ) -> torch.FloatTensor:
         '''
         x: [B, X_d, X_t]
@@ -334,47 +352,64 @@ class FFT_Block(torch.nn.Module):
         masks = None
         float_masks = 1.0
         if not lengths is None:
-            masks = Mask_Generate(lengths= lengths, max_length= torch.ones_like(x[0, 0]).sum())    # [Batch, Time]
+            masks = Mask_Generate(lengths= lengths, max_length= torch.ones_like(x[0, 0]).sum())    # [Batch, X_t]
             float_masks = (~masks).unsqueeze(1).float()   # float mask, [Batch, 1, X_t]
 
-        # attention block
-        residuals = x_attentions = x.permute(2, 0, 1).contiguous()
-        x_attentions, _ = self.attention(
-            query= x_attentions,
-            key= x_attentions,
-            value= x_attentions,
+        residuals = x.mT    # [Batch, X_t, X_d]
+        x_self_attentions = x_cross_attentions = x.permute(2, 0, 1).contiguous()    # [X_t, Batch, X_d]
+        x_self_attentions, _ = self.self_attention(
+            query= x_self_attentions,
+            key= x_self_attentions,
+            value= x_self_attentions,
             key_padding_mask= masks
-            )   # [X_t, X_d, Batch]
-        
-        if self.norm_type == Norm_Type.LayerNorm:
-            x_attentions = self.attention_norm(x_attentions + residuals).permute(1, 2, 0) * float_masks
-        elif self.norm_type in [Norm_Type.Conditional_LayerNorm, Norm_Type.Mixed_LayerNorm]:
-            x_attentions = self.attention_norm(
-                x= (x_attentions + residuals).permute(1, 0, 2),
-                conditions= conditions.mT
-                ).mT * float_masks
+            )   # [X_t, Batch, X_d]
+        x_self_attentions = x_self_attentions.permute(1, 0, 2)  # [Batch, X_t, X_d]
 
-        # conv block
-        x_convs = x
-        for block in self.residual_conv_blocks:
-            x_convs = block(
-                x= x_convs,
-                conditions= conditions,
-                float_masks= float_masks
-                )
+        global_conditions = None
+        if self.use_condition:
+            condition_masks = None
+            condition_float_masks = 1.0
+            if not condition_lengths is None:
+                condition_masks = Mask_Generate(lengths= condition_lengths, max_length= torch.ones_like(conditions[0, 0]).sum())    # [Batch, C_t]
+                condition_float_masks = (~condition_masks).unsqueeze(1).float()   # float mask, [Batch, 1, C_t]
+
+            global_conditions = (conditions * condition_float_masks).sum(dim= 2) / condition_float_masks.sum(dim= 2)    # [Batch, C_d]
+            global_conditions = self.gelu(global_conditions)
+            global_conditions = self.global_condition_norm(global_conditions)[:, None, :] # [Batch, 1, C_d]
+
+            conditions = conditions.permute(2, 0, 1).contiguous()   # [C_t, Batch, C_d]        
+            x_cross_attentions, _ = self.cross_attention(
+                query= x_cross_attentions,
+                key= conditions,
+                value= conditions,
+                key_padding_mask= condition_masks
+                )   # [X_t, Batch, X_d]
+
+            x_cross_attentions = x_cross_attentions.permute(1, 0, 2)    # [Batch, X_t, X_d]
+
+            if self.norm_type == Norm_Type.LayerNorm:
+                x_self_attentions = self.self_attention_norm(x_self_attentions) # [Batch, X_t, X_d]
+                x_cross_attentions = self.cross_attention_norm(x_cross_attentions)  # [Batch, X_t, X_d]
+            elif self.norm_type in [Norm_Type.Conditional_LayerNorm, Norm_Type.Mixed_LayerNorm]:
+                x_self_attentions = self.self_attention_norm(x_self_attentions, global_conditions)
+                x_cross_attentions = self.cross_attention_norm(x_cross_attentions, global_conditions)
+
+        if self.use_condition:
+            x = x_self_attentions + x_cross_attentions + residuals
+        else:
+            x = x_self_attentions + residuals
 
         if self.norm_type == Norm_Type.LayerNorm:
-            x = self.norm((x_attentions + x_convs).mT).mT * float_masks
+            x = self.residual_norm(x).mT * float_masks   # [Batch, X_d, X_t]
         elif self.norm_type in [Norm_Type.Conditional_LayerNorm, Norm_Type.Mixed_LayerNorm]:
-            x = self.norm(
-                x= (x_attentions + x_convs).mT,
-                conditions= conditions.mT
-                ).mT * float_masks
-        
+            x = self.residual_norm(x, global_conditions).mT * float_masks
+
         # feed forward
+        if not global_conditions is None:
+            global_conditions = global_conditions.mT
         x = self.ffn(
             x= x,
-            conditions= conditions,
+            conditions= global_conditions,
             float_masks= float_masks
             )
         
@@ -401,13 +436,13 @@ class FFN(torch.nn.Module):
             bias= False
             ), w_init_gain= 'gelu')
         self.gelu = torch.nn.GELU(approximate= 'tanh')
-        self.conv_1 = torch.nn.Conv1d(
+        self.conv_1 = Conv_Init(torch.nn.Conv1d(
             in_channels= channels,
             out_channels= channels,
             kernel_size= kernel_size,
             padding= (kernel_size - 1) // 2,
             bias= False
-            )
+            ), w_init_gain= 'linear')
 
         if norm_type == Norm_Type.LayerNorm:
             self.norm = torch.nn.LayerNorm(channels)
@@ -431,6 +466,9 @@ class FFN(torch.nn.Module):
         conditions: Optional[torch.FloatTensor]= None,
         float_masks: Optional[torch.FloatTensor]= 1.0,
         ):
+        '''
+        conditions: [B, C_d, X_t or 1]
+        '''
         residuals = x
         x = self.conv_0(x * float_masks)
         x = self.gelu(x)

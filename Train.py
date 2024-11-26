@@ -332,9 +332,9 @@ class Trainer:
                 
             self.optimizer_dict['RectifiedFlowTTS'].step()
             if self.num_gpus > 1:
-                self.model_dict['RectifiedFlowTTS_EMA'].module.update_parameters(self.model_dict['RectifiedFlowSVS'])
+                self.model_dict['RectifiedFlowTTS_EMA'].module.update_parameters(self.model_dict['RectifiedFlowTTS'])
             else:
-                self.model_dict['RectifiedFlowTTS_EMA'].update_parameters(self.model_dict['RectifiedFlowSVS'])
+                self.model_dict['RectifiedFlowTTS_EMA'].update_parameters(self.model_dict['RectifiedFlowTTS'])
 
             self.steps += 1
             self.tqdm.update(1)

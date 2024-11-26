@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Union
 from tqdm import tqdm
 from torchdiffeq import odeint
 
-from .Layer import Conv_Init, Lambda, FFT_Block, Prompt_Block
+from .Layer import Conv_Init, Lambda, FFT_Block, Norm_Type
 
 class Diffusion(torch.nn.Module):
     def __init__(
@@ -178,44 +178,14 @@ class Network(torch.nn.Module):
             Lambda(lambda x: x[:, :, None])
             )
 
-        self.prompt_ffn = torch.nn.Sequential(
-            Conv_Init(torch.nn.Conv1d(
-                in_channels= self.hp.Encoder.Size,
-                out_channels= self.hp.Diffusion.Size * 4,
-                kernel_size= 1,
-                ), w_init_gain= 'gelu'),
-            torch.nn.GELU(approximate= 'tanh'),
-            Conv_Init(torch.nn.Conv1d(
-                in_channels= self.hp.Diffusion.Size * 4,
-                out_channels= self.hp.Diffusion.Size,
-                kernel_size= 1,
-                ), w_init_gain= 'linear')
-            )
-
-        
-
-        self.prompt_blocks: List[Prompt_Block] = torch.nn.ModuleList([
-            Prompt_Block(
-                channels= self.hp.Diffusion.Size,
-                num_head= self.hp.Diffusion.Transformer.Head,
-                residual_conv_stack= self.hp.Diffusion.Transformer.Residual_Conv.Stack,
-                residual_conv_kernel_size= self.hp.Diffusion.Transformer.Residual_Conv.Kernel_Size,
-                ffn_kernel_size= self.hp.Diffusion.Transformer.FFN.Kernel_Size,
-                residual_conv_dropout_rate= self.hp.Diffusion.Transformer.Residual_Conv.Dropout_Rate,
-                ffn_dropout_rate= self.hp.Diffusion.Transformer.FFN.Dropout_Rate,
-                )
-            for _ in range(self.hp.Diffusion.Transformer.Stack)
-            ])  # real type: torch.nn.ModuleList[FFT_BLock]
-
         self.blocks: List[FFT_Block] = torch.nn.ModuleList([
             FFT_Block(
                 channels= self.hp.Diffusion.Size,
                 num_head= self.hp.Diffusion.Transformer.Head,
-                residual_conv_stack= self.hp.Diffusion.Transformer.Residual_Conv.Stack,
-                residual_conv_kernel_size= self.hp.Diffusion.Transformer.Residual_Conv.Kernel_Size,
                 ffn_kernel_size= self.hp.Diffusion.Transformer.FFN.Kernel_Size,
-                residual_conv_dropout_rate= self.hp.Diffusion.Transformer.Residual_Conv.Dropout_Rate,
                 ffn_dropout_rate= self.hp.Diffusion.Transformer.FFN.Dropout_Rate,
+                norm_type= Norm_Type.Conditional_LayerNorm,
+                condition_channels= self.hp.Encoder.Size,
                 )
             for _ in range(self.hp.Diffusion.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
@@ -255,19 +225,17 @@ class Network(torch.nn.Module):
         x = self.prenet(noised_latents)
         encodings = self.encoding_ffn(encodings)
         f0s = self.f0_ffn(f0s)
-        prompts = self.prompt_ffn(prompts)
         diffusion_steps = self.step_ffn(diffusion_steps) # [Batch, Res_d, 1]
 
         x = x + encodings + f0s + diffusion_steps
 
-        for block, prompt_block in zip(self.blocks, self.prompt_blocks):
-            x = prompt_block(
+        for block in self.blocks:
+            x = block(
                 x= x,
-                prompts= prompts,
                 lengths= lengths,
-                prompt_lengths= prompt_lengths
+                conditions= prompts,
+                condition_lengths= prompt_lengths
                 )
-            x = block(x, lengths)
 
         prediction_tokens = None
         if use_token_predictor:

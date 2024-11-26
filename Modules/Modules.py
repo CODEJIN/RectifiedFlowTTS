@@ -4,13 +4,11 @@ import math
 from typing import Union, List, Optional
 
 from .Nvidia_Alignment_Learning_Framework import Alignment_Learning_Framework
-from .Layer import Conv_Init, Embedding_Initialize_, FFT_Block, Prompt_Block, Positional_Encoding
+from .Layer import Conv_Init, Embedding_Initialize_, FFT_Block, Prompt_Block
 from .GRL import GRL
 from .Diffusion import Diffusion
 
 from hificodec.vqvae import VQVAE
-
-# TODO: Speech prompt
 
 class RectifiedFlowTTS(torch.nn.Module):
     def __init__(
@@ -95,7 +93,7 @@ class RectifiedFlowTTS(torch.nn.Module):
             prompt_lengths= reference_latent_code_lengths
             )   # [Batch, Dec_t]
 
-        flows, prediction_flows, _, _ = self.diffusion(
+        flows, prediction_flows, _, _, prediction_tokens = self.diffusion(
             encodings= encodings,
             f0s= f0s,
             latents= latents,
@@ -108,7 +106,7 @@ class RectifiedFlowTTS(torch.nn.Module):
             flows, prediction_flows, \
             durations, prediction_durations, prediction_f0s, \
             attention_softs, attention_hards, attention_logprobs, \
-            prediction_speakers, alignments
+            prediction_speakers, prediction_tokens, alignments
     
     def Inference(
         self,
@@ -212,11 +210,6 @@ class Encoder(torch.nn.Module):
             )
         Embedding_Initialize_(self.language_embedding)
         
-        self.positional_encoding = Positional_Encoding(
-            num_embeddings= self.hp.Durations,
-            embedding_dim= self.hp.Encoder.Size
-            )
-        
         self.blocks: List[FFT_Block] = torch.nn.ModuleList([
             FFT_Block(
                 channels= self.hp.Encoder.Size,
@@ -248,9 +241,6 @@ class Encoder(torch.nn.Module):
             languages = languages[:, None, :]  # [Batch, 1, Enc_d]
         encodings = encodings + languages
 
-        encodings = encodings + self.positional_encoding(
-            position_ids= torch.arange(encodings.size(1), device= encodings.device)[None]
-            )        
         encodings = encodings.mT # [Batch, Enc_d, Enc_t]        
         
         for block in self.blocks:
@@ -272,11 +262,6 @@ class Prompt_Encoder(torch.nn.Module):
             kernel_size= 1
             ), w_init_gain= 'gelu')
         self.gelu = torch.nn.GELU(approximate= 'tanh')
-
-        self.positional_encoding = Positional_Encoding(
-            num_embeddings= self.hp.Durations,
-            embedding_dim= self.hp.Encoder.Size
-            )
         
         self.blocks: List[FFT_Block] = torch.nn.ModuleList([
             FFT_Block(
@@ -302,10 +287,7 @@ class Prompt_Encoder(torch.nn.Module):
         '''
         latents = self.prenet(latents)
         latents = self.gelu(latents)
-        latents = latents + self.positional_encoding(
-            position_ids= torch.arange(latents.size(2), device= latents.device)[None]
-            ).mT    # using detach.
-
+        
         for block in self.blocks:
             latents = block(latents, lengths)
 
@@ -319,11 +301,6 @@ class Duration_Predictor(torch.nn.Module):
         super().__init__()
         self.hp = hyper_parameters
  
-        self.positional_encoding = Positional_Encoding(
-            num_embeddings= self.hp.Durations,
-            embedding_dim= self.hp.Encoder.Size
-            )
-
         self.prompt_blocks: List[Prompt_Block] = torch.nn.ModuleList([
             Prompt_Block(
                 channels= self.hp.Encoder.Size,
@@ -367,12 +344,7 @@ class Duration_Predictor(torch.nn.Module):
         encodings: [Batch, Enc_d, Enc_t]        
         lengths: [Batch], token length
         '''
-        encodings = encodings.detach() + self.positional_encoding(
-            position_ids= torch.arange(encodings.size(2), device= encodings.device)[None]
-            ).mT    # using detach.
-        prompts = prompts + self.positional_encoding(
-            position_ids= torch.arange(prompts.size(2), device= prompts.device)[None]
-            ).mT
+        encodings = encodings.detach()
 
         for block, prompt_block in zip(self.blocks, self.prompt_blocks):
             encodings = prompt_block(
@@ -395,11 +367,6 @@ class F0_Predictor(torch.nn.Module):
         super().__init__()
         self.hp = hyper_parameters
  
-        self.positional_encoding = Positional_Encoding(
-            num_embeddings= self.hp.Durations,
-            embedding_dim= self.hp.Encoder.Size
-            )
-
         self.prompt_blocks: List[Prompt_Block] = torch.nn.ModuleList([
             Prompt_Block(
                 channels= self.hp.Encoder.Size,
@@ -443,13 +410,8 @@ class F0_Predictor(torch.nn.Module):
         encodings: [Batch, Enc_d, Dec_t]        
         lengths: [Batch], latent length
         '''
-        encodings = encodings.detach() + self.positional_encoding(
-            position_ids= torch.arange(encodings.size(2), device= encodings.device)[None]
-            ).mT    # using detach.
-        prompts = prompts + self.positional_encoding(
-            position_ids= torch.arange(prompts.size(2), device= prompts.device)[None]
-            ).mT
-
+        encodings = encodings.detach()
+        
         for block, prompt_block in zip(self.blocks, self.prompt_blocks):
             encodings = prompt_block(
                 x= encodings,
@@ -525,11 +487,6 @@ class Frame_Prior_Network(torch.nn.Module):
         super().__init__()
         self.hp = hyper_parameters
 
-        self.positional_encoding = Positional_Encoding(
-            num_embeddings= self.hp.Durations,
-            embedding_dim= self.hp.Encoder.Size
-            )
-
         self.blocks: List[FFT_Block] = torch.nn.ModuleList([
             FFT_Block(
                 channels= self.hp.Encoder.Size,
@@ -552,9 +509,6 @@ class Frame_Prior_Network(torch.nn.Module):
         encodings: [Batch, Enc_d, Dec_t],
         lengths: [Batch], latent length
         '''
-        encodings = encodings + self.positional_encoding(
-            position_ids= torch.arange(encodings.size(2), device= encodings.device)[None]
-            ).mT    # [Batch, Enc_d, Dec_t]
         for block in self.blocks:
             encodings = block(encodings, lengths)
         

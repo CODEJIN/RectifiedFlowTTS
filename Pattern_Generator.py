@@ -295,7 +295,7 @@ def Selvas_Info_Load(path: str):
         return paths, text_dict, pronunciation_dict, speaker_dict, emotion_dict, language_dict, gender_dict
     
     paths = []
-    for root, _, files in os.walk(path):
+    for root, _, files in os.walk(path, followlinks= True):
         for file in files:
             file = os.path.join(root, file).replace('\\', '/')
             if not os.path.splitext(file)[1].upper() in using_extension:
@@ -495,7 +495,7 @@ def AIHub_Info_Load(path: str, n_sample_by_speaker: Optional[int]= None):
     skip_info_keys = []
     info_dict = {}
     n_sample_by_speaker_dict = defaultdict(int)
-    for root, _, files in os.walk(path):
+    for root, _, files in os.walk(path, followlinks= True):
         for file in files:
             key, extension = os.path.splitext(file)
             if not key in info_dict.keys():
@@ -598,7 +598,7 @@ def Basic_Info_Load(
         return paths, text_dict, pronunciation_dict, speaker_dict, emotion_dict, language_dict, gender_dict
     
     paths = []
-    for root, _, files in os.walk(path):
+    for root, _, files in os.walk(path, followlinks= True):
         for file in files:
             file = os.path.join(root, file).replace('\\', '/')
             if not os.path.splitext(file)[1].upper() in using_extension:
@@ -687,7 +687,7 @@ def VCTK_Info_Load(path: str):
     path = os.path.join(path, 'wav48').replace('\\', '/')
     
     paths = []
-    for root, _, files in os.walk(path):
+    for root, _, files in os.walk(path, followlinks= True):
         for file in files:
             file = os.path.join(root, file).replace('\\', '/')
             if not os.path.splitext(file)[1].upper() in using_extension:
@@ -882,7 +882,7 @@ def Libri_Info_Load(path: str, n_sample_by_speaker: Optional[int]= None):
         ]
 
     paths = []
-    for root, _, files in os.walk(path):
+    for root, _, files in os.walk(path, followlinks= True):
         for file in files:
             file_path = os.path.join(root, file).replace('\\', '/')
             if not os.path.splitext(file_path)[1].upper() in using_extension:
@@ -975,7 +975,7 @@ def LJ_Info_Load(path: str):
         return paths, text_dict, pronunciation_dict, speaker_dict, emotion_dict, language_dict, gender_dict
 
     paths = []
-    for root, _, files in os.walk(path):
+    for root, _, files in os.walk(path, followlinks= True):
         for file in files:
             file = os.path.join(root, file).replace('\\', '/')
             if not os.path.splitext(file)[1].upper() in using_extension:

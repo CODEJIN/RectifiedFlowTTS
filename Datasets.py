@@ -237,7 +237,7 @@ class Collater:
 
         tokens = torch.LongTensor(tokens)   # [Batch, Token_t]
         token_lengths = torch.LongTensor(token_lengths)   # [Batch]
-        reference_latent_codes = torch.LongTensor(latent_codes)  # [Batch, Latent_Code_n, Latent_t]
+        reference_latent_codes = torch.LongTensor(reference_latent_codes)  # [Batch, Latent_Code_n, Latent_t]
         reference_latent_code_lengths = torch.LongTensor(latent_code_lengths)   # [Batch]
         languages = torch.LongTensor(languages)   # [Batch]
         latent_codes = torch.LongTensor(latent_codes)  # [Batch, Latent_Code_n, Latent_t]

@@ -11,6 +11,7 @@ matplotlib.use('agg')
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
 from accelerate import Accelerator
+from accelerate import DistributedDataParallelKwargs
 from Logger import Logger
 from typing import List
 
@@ -61,7 +62,8 @@ class Trainer:
         self.accelerator = Accelerator(
             split_batches= True,
             mixed_precision= 'fp16' if self.hp.Use_Mixed_Precision else 'no',   # no, fp16, bf16, fp8
-            gradient_accumulation_steps= self.hp.Train.Accumulated_Gradient_Step
+            gradient_accumulation_steps= self.hp.Train.Accumulated_Gradient_Step,
+            kwargs_handlers= [DistributedDataParallelKwargs(find_unused_parameters= True), ]
             )
 
         if not torch.cuda.is_available():
@@ -208,6 +210,10 @@ class Trainer:
             'CE': torch.nn.CrossEntropyLoss().to(self.device),
             'Attention_Binarization': AttentionBinarizationLoss(),
             'Attention_CTC': AttentionCTCLoss(),
+            'TokenCTC': torch.nn.CTCLoss(
+                blank= self.hp.Tokens,  # == Token length
+                zero_infinity= True
+                ),
             }
 
         self.optimizer_dict = {
@@ -261,7 +267,7 @@ class Trainer:
             flows, prediction_flows, \
             durations, prediction_durations, prediction_f0s, \
             attention_softs, attention_hards, attention_logprobs, \
-            prediction_speakers, _ = self.model_dict['RectifiedFlowTTS'](
+            prediction_speakers, prediction_tokens, _ = self.model_dict['RectifiedFlowTTS'](
                 tokens= tokens,
                 token_lengths= token_lengths,
                 reference_latent_codes= reference_latent_codes,
@@ -286,7 +292,7 @@ class Trainer:
             loss_dict['Diffusion'] = (self.criterion_dict['MSE'](
                 prediction_flows,
                 flows,
-                ) * latent_masks).sum() / latent_masks.sum() / prediction_flows.size(1)            
+                ) * latent_masks).sum() / latent_masks.sum() / prediction_flows.size(1)
             loss_dict['Attention_Binarization'] = self.criterion_dict['Attention_Binarization'](attention_hards, attention_softs)
             loss_dict['Attention_CTC'] = self.criterion_dict['Attention_CTC'](attention_logprobs, token_lengths, latent_code_lengths)            
             loss_dict['Duration'] = (self.criterion_dict['MSE'](
@@ -300,6 +306,12 @@ class Trainer:
             loss_dict['Speaker'] = self.criterion_dict['CE'](
                 input= prediction_speakers,
                 target= speakers.long(),
+                )
+            loss_dict['Token'] = self.criterion_dict['TokenCTC'](
+                log_probs= prediction_tokens.permute(2, 0, 1),  # [Latent_t, Batch, Token_n]
+                targets= tokens,
+                input_lengths= latent_code_lengths,
+                target_lengths= token_lengths
                 )
 
             self.optimizer_dict['RectifiedFlowTTS'].zero_grad()
@@ -318,8 +330,11 @@ class Trainer:
                     max_norm= self.hp.Train.Gradient_Norm
                     )
                 
-            self.optimizer_dict['RectifiedFlowTTS'].step()            
-            self.model_dict['RectifiedFlowTTS_EMA'].update_parameters(self.model_dict['RectifiedFlowTTS'])
+            self.optimizer_dict['RectifiedFlowTTS'].step()
+            if self.num_gpus > 1:
+                self.model_dict['RectifiedFlowTTS_EMA'].module.update_parameters(self.model_dict['RectifiedFlowSVS'])
+            else:
+                self.model_dict['RectifiedFlowTTS_EMA'].update_parameters(self.model_dict['RectifiedFlowSVS'])
 
             self.steps += 1
             self.tqdm.update(1)
@@ -397,7 +412,7 @@ class Trainer:
         flows, prediction_flows, \
         durations, prediction_durations, prediction_f0s, \
         attention_softs, attention_hards, attention_logprobs, \
-        prediction_speakers, alignments = self.model_dict['RectifiedFlowTTS_EMA'](
+        prediction_speakers, prediction_tokens, alignments = self.model_dict['RectifiedFlowTTS_EMA'](
             tokens= tokens,
             token_lengths= token_lengths,
             reference_latent_codes= reference_latent_codes,
@@ -437,7 +452,13 @@ class Trainer:
             input= prediction_speakers,
             target= speakers.long(),
             )
-
+        loss_dict['Token'] = self.criterion_dict['TokenCTC'](
+            log_probs= prediction_tokens.permute(2, 0, 1),  # [Latent_t, Batch, Token_n]
+            targets= tokens,
+            input_lengths= latent_code_lengths,
+            target_lengths= token_lengths
+            )
+        
         for tag, loss in loss_dict.items():
             self.scalar_dict['Evaluation']['Loss/{}'.format(tag)] += loss.item()
 
@@ -731,7 +752,6 @@ class Trainer:
 
         self.accelerator.wait_for_everyone()
         self.accelerator.save_state(checkpoint_path, safe_serialization= False) # sefetensor cannot use because of shared tensor problem
-        # self.accelerator.save_state(checkpoint_path)
 
         logging.info('Checkpoint saved at {} steps.'.format(self.steps))
 

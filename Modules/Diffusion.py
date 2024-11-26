@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Union
 from tqdm import tqdm
 from torchdiffeq import odeint
 
-from .Layer import Conv_Init, Lambda, FFT_Block, Prompt_Block, Positional_Encoding
+from .Layer import Conv_Init, Lambda, FFT_Block, Prompt_Block
 
 class Diffusion(torch.nn.Module):
     def __init__(
@@ -42,14 +42,15 @@ class Diffusion(torch.nn.Module):
         flows = latents - noises
 
         # predict flow
-        network_output = self.network(
+        network_output, prediction_tokens = self.network(
             noised_latents= noised_latents,
             encodings= encodings,
             f0s= f0s,
             lengths= lengths,
             prompts= prompts,
             prompt_lengths= prompt_lengths,
-            diffusion_steps= cosmap_schedule_times[:, 0, 0] # [Batch]
+            diffusion_steps= cosmap_schedule_times[:, 0, 0], # [Batch]
+            use_token_predictor= True
             )
         
         if self.hp.Diffusion.Network_Prediction == 'Flow':
@@ -63,7 +64,7 @@ class Diffusion(torch.nn.Module):
 
         # prediction_latents = noised_latents + prediction_flows * (1.0 - cosmap_schedule_times)    # not using
 
-        return flows, prediction_flows, noises, prediction_noises
+        return flows, prediction_flows, noises, prediction_noises, prediction_tokens
     
     def Inference(
         self,
@@ -85,7 +86,7 @@ class Diffusion(torch.nn.Module):
             cosmap_schedule_times = self.cosmap_calc(diffusion_times)[:, None, None]
 
             # predict flow
-            network_output = self.network(
+            network_output, _ = self.network(
                 noised_latents= noised_latents,
                 encodings= encodings,
                 f0s= f0s,
@@ -193,11 +194,6 @@ class Network(torch.nn.Module):
 
         
 
-        self.positional_encoding = Positional_Encoding(
-            num_embeddings= self.hp.Durations,
-            embedding_dim= self.hp.Diffusion.Size
-            )
-
         self.prompt_blocks: List[Prompt_Block] = torch.nn.ModuleList([
             Prompt_Block(
                 channels= self.hp.Diffusion.Size,
@@ -237,6 +233,8 @@ class Network(torch.nn.Module):
                 kernel_size= 1), w_init_gain= 'zero'),
             )
 
+        self.token_predictor = Token_Predictor(self.hp)
+
     def forward(
         self,
         noised_latents: torch.Tensor,
@@ -245,7 +243,8 @@ class Network(torch.nn.Module):
         lengths: torch.Tensor,        
         prompts: torch.FloatTensor,
         prompt_lengths: torch.IntTensor,
-        diffusion_steps: torch.Tensor
+        diffusion_steps: torch.Tensor,
+        use_token_predictor: bool= False
         ):
         '''
         noised_latents: [Batch, Latent_d, Dec_t]
@@ -259,9 +258,7 @@ class Network(torch.nn.Module):
         prompts = self.prompt_ffn(prompts)
         diffusion_steps = self.step_ffn(diffusion_steps) # [Batch, Res_d, 1]
 
-        x = x + encodings + f0s + diffusion_steps + self.positional_encoding(
-            position_ids= torch.arange(x.size(2), device= encodings.device)[None]
-            ).mT
+        x = x + encodings + f0s + diffusion_steps
 
         for block, prompt_block in zip(self.blocks, self.prompt_blocks):
             x = prompt_block(
@@ -272,9 +269,13 @@ class Network(torch.nn.Module):
                 )
             x = block(x, lengths)
 
+        prediction_tokens = None
+        if use_token_predictor:
+            prediction_tokens = self.token_predictor(x)
+
         x = self.projection(x)
 
-        return x
+        return x, prediction_tokens
 
 class Step_Embedding(torch.nn.Module):
     '''
@@ -299,6 +300,49 @@ class Step_Embedding(torch.nn.Module):
         x = torch.cat([x.sin(), x.cos()], dim= 1)
 
         return x
+
+
+class Token_Predictor(torch.nn.Module): 
+    def __init__(
+        self,
+        hyper_parameters: Namespace
+        ):
+        super().__init__()
+        self.hp = hyper_parameters
+        
+        self.lstm = torch.nn.LSTM(
+            input_size= self.hp.Audio_Codec_Size,
+            hidden_size= self.hp.Diffusion.Token_Predictor.Size,
+            num_layers= self.hp.Diffusion.Token_Predictor.LSTM.Stack,
+            )
+        self.lstm_dropout = torch.nn.Dropout(
+            p= self.hp.Diffusion.Token_Predictor.LSTM.Dropout_Rate,
+            )
+
+        self.projection = Conv_Init(torch.nn.Conv1d(
+            in_channels= self.hp.Diffusion.Token_Predictor.Size,
+            out_channels= self.hp.Tokens + 1,
+            kernel_size= 1,
+            ), w_init_gain= 'linear')
+            
+    def forward(
+        self,
+        encodings: torch.Tensor,
+        ) -> torch.Tensor:
+        '''
+        features: [Batch, Feature_d, Feature_t], Spectrogram
+        lengths: [Batch]
+        '''
+        encodings = encodings.permute(2, 0, 1)    # [Feature_t, Batch, Enc_d]
+        
+        self.lstm.flatten_parameters()
+        encodings = self.lstm(encodings)[0] # [Feature_t, Batch, LSTM_d]
+        
+        predictions = self.projection(encodings.permute(1, 2, 0))
+        predictions = torch.nn.functional.log_softmax(predictions, dim= 1)
+
+        return predictions
+
 
 @torch.jit.script
 def Fused_Gate(x):

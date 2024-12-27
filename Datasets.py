@@ -124,10 +124,6 @@ class Dataset(torch.utils.data.Dataset):
             self.Pattern_LRU_Cache = functools.lru_cache(maxsize= None)(self.Pattern_LRU_Cache)
 
     def __getitem__(self, idx):
-        '''
-        compressed latent is for diffusion.
-        non-compressed latent is for speech prompt.        
-        '''
         path = os.path.join(self.pattern_path, self.patterns[idx]).replace('\\', '/')
         token, languages, latent_code, f0, mel, speaker_id, speaker = self.Pattern_LRU_Cache(path)
 

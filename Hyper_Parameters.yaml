@@ -64,8 +64,9 @@ Frame_Prior_Network:
             Dropout_Rate: 0.1
 
 
-Diffusion:
+CFM:
     Size: 512
+    Scheduler: 'Uniform' # 'Cosmap'
     Transformer:
         Stack: 6
         Head: 2
@@ -79,6 +80,7 @@ Diffusion:
             Stack: 2
             Dropout_Rate: 0.0
     Network_Prediction: 'Flow'   # 'Flow', 'Noise'
+    Use_CFG: true
 
 
 Token_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK/Token.yaml'
@@ -113,7 +115,7 @@ Train:
             Min: 10
             Max: 200
     Num_Workers: 2
-    Batch_Size: 10
+    Batch_Size: 8
     Learning_Rate:
         Initial: 1.0e-4
         Decay: 0.999875
@@ -123,6 +125,7 @@ Train:
         Beta2: 0.999
         Epsilon: 1.0e-7
     Weight_Decay: 1.0e-6
+    CFG_Alpha: 0.1  # only using when Use_CFG is true
     Accumulated_Gradient_Step: 1 # 25    
     Gradient_Norm: 1.0
     Discriminator_Lambda: 1.0
@@ -154,9 +157,9 @@ Train:
             ]
 
 Inference_Batch_Size: 8
-Inference_Path: './results/VCTK/Inference'
-Checkpoint_Path: './results/VCTK/Checkpoint'
-Log_Path: './results/VCTK/Log'
+Inference_Path: './results/VCTK_CFG_Unifrom/Inference'
+Checkpoint_Path: './results/VCTK_CFG_Unifrom/Checkpoint'
+Log_Path: './results/VCTK_CFG_Unifrom/Log'
 
 Weights_and_Biases:
     Use: false
@@ -167,7 +170,7 @@ Weights_and_Biases:
         Use: false
         Interval: 50000 # Unlike local, The capacity of WandB is small.
 
-Use_Mixed_Precision: true
+Use_Mixed_Precision: false
 # Use_Multi_GPU: true
 # Device: '0,1,2,3,4,5,6,7'
 Use_Multi_GPU: false

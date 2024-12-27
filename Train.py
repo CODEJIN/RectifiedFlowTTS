@@ -23,6 +23,13 @@ from hificodec.vqvae import VQVAE
 from meldataset import mel_spectrogram
 from Arg_Parser import Recursive_Parse, To_Non_Recursive_Dict
 
+# 1. CFG
+# 2. Scheduler
+# 3. Optimal transport
+
+
+
+
 import matplotlib as mpl
 # 유니코드 깨짐현상 해결
 mpl.rcParams['axes.unicode_minus'] = False
@@ -289,7 +296,7 @@ class Trainer:
                 max_length= latent_codes.size(2)
                 ).to(latent_codes.device)[:, None, :]
             
-            loss_dict['Diffusion'] = (self.criterion_dict['MSE'](
+            loss_dict['CFM'] = (self.criterion_dict['MSE'](
                 prediction_flows,
                 flows,
                 ) * latent_masks).sum() / latent_masks.sum() / prediction_flows.size(1)
@@ -316,7 +323,7 @@ class Trainer:
 
             self.optimizer_dict['RectifiedFlowTTS'].zero_grad()
             self.accelerator.backward(
-                loss_dict['Diffusion'] +
+                loss_dict['CFM'] +
                 loss_dict['Attention_Binarization'] +
                 loss_dict['Attention_CTC'] +
                 loss_dict['Duration'] +
@@ -434,7 +441,7 @@ class Trainer:
             max_length= latent_codes.size(2)
             ).to(latent_codes.device)[:, None, :]
         
-        loss_dict['Diffusion'] = (self.criterion_dict['MSE'](
+        loss_dict['CFM'] = (self.criterion_dict['MSE'](
             prediction_flows,
             flows,
             ) * latent_masks).sum() / latent_masks.sum() / prediction_flows.size(1)

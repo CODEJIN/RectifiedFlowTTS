@@ -6,7 +6,7 @@ from typing import Union, List, Optional
 from .Nvidia_Alignment_Learning_Framework import Alignment_Learning_Framework
 from .Layer import Conv_Init, Embedding_Initialize_, FFT_Block, Norm_Type
 from .GRL import GRL
-from .Diffusion import Diffusion
+from .CFM import CFM
 
 from hificodec.vqvae import VQVAE
 
@@ -34,7 +34,7 @@ class RectifiedFlowTTS(torch.nn.Module):
 
         self.frame_prior_network = Frame_Prior_Network(self.hp)
 
-        self.diffusion = Diffusion(self.hp)
+        self.cfm = CFM(self.hp)
 
         self.hificodec = hificodec
         self.hificodec.eval()
@@ -99,7 +99,7 @@ class RectifiedFlowTTS(torch.nn.Module):
             prompt_lengths= reference_latent_code_lengths
             )   # [Batch, Dec_t]
 
-        flows, prediction_flows, _, _, prediction_tokens = self.diffusion(
+        flows, prediction_flows, _, _, prediction_tokens = self.cfm(
             encodings= encodings,
             f0s= f0s,
             latents= latents,
@@ -121,7 +121,7 @@ class RectifiedFlowTTS(torch.nn.Module):
         reference_latent_codes: torch.LongTensor,
         reference_latent_code_lengths: torch.LongTensor,
         languages: torch.LongTensor,
-        diffusion_steps: int= 16
+        cfm_steps: int= 16
         ):
         with torch.no_grad():
             reference_latents = self.hificodec.quantizer.embed(reference_latent_codes.mT).detach()
@@ -166,16 +166,16 @@ class RectifiedFlowTTS(torch.nn.Module):
             prompt_lengths= reference_latent_code_lengths
             )   # [Batch, Dec_t]
 
-        latents = self.diffusion.Inference(
+        latents = self.cfm.Inference(
             encodings= encodings,
             f0s= f0s,
             lengths= latent_code_lengths,
-            steps= diffusion_steps,
+            steps= cfm_steps,
             prompts= prompts,
             prompt_lengths= reference_latent_code_lengths
             )
 
-        # Performing VQ to correct the incomplete predictions of diffusion.
+        # Performing VQ to correct the incomplete predictions.
         *_, latent_codes = self.hificodec.quantizer(latents)
         latent_codes = [code.reshape(tokens.size(0), -1) for code in latent_codes]
         latent_codes = torch.stack(latent_codes, 2)

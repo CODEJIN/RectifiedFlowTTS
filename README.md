@@ -1,6 +1,6 @@
 # RectifiedFlowTTS
 
-* Diffusion TTS model based on RectifiedFlow
+* CFM TTS model based on RectifiedFlow
 * Multi-speaker structure is based on NaturalSpeech 2 or 3
 * TODO
     - [X] Singing speaker(LJSpeech) base model making

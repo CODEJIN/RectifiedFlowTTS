@@ -7,7 +7,9 @@ from torchdiffeq import odeint
 
 from .Layer import Conv_Init, Lambda, FFT_Block, Norm_Type
 
-class Diffusion(torch.nn.Module):
+# https://github.com/rtqichen/torchdiffeq/blob/master/examples/ode_demo.py
+
+class CFM(torch.nn.Module):
     def __init__(
         self,
         hyper_parameters: Namespace
@@ -18,7 +20,13 @@ class Diffusion(torch.nn.Module):
         self.network = Network(
             hyper_parameters= self.hp
             )
-        self.cosmap_calc = lambda x: 1.0 - (1 / (torch.tan(torch.pi / 2.0 * x) + 1))
+
+        if self.hp.CFM.Scheduler.upper() == 'Uniform'.upper():
+            self.timestep_scheduler = lambda x: x
+        elif self.hp.CFM.Scheduler.upper() == 'Cosmap'.upper():
+            self.timestep_scheduler = lambda x: 1.0 - (1 / (torch.tan(torch.pi / 2.0 * x) + 1))
+        else:
+            raise NotImplementedError(f'Unsupported CFM scheduler: {self.hp.CFM.Scheduler}')
 
     def forward(
         self,
@@ -33,36 +41,45 @@ class Diffusion(torch.nn.Module):
         encodings: [Batch, Enc_d, Dec_t]
         latents: [Batch, Latent_d, Latent_t]
         '''
-        diffusion_times = torch.rand(encodings.size(0), device= encodings.device)   # [Batch]
-        cosmap_schedule_times = self.cosmap_calc(diffusion_times)[:, None, None]
+        selected_times = torch.rand(encodings.size(0), device= encodings.device)   # [Batch]
+        schedule_times = self.timestep_scheduler(selected_times)[:, None, None]
 
         noises = torch.randn_like(latents)  # [Batch, Latent_d, Latent_t]
 
-        noised_latents = cosmap_schedule_times * latents + (1.0 - cosmap_schedule_times) * noises
+        noised_latents = schedule_times * latents + (1.0 - schedule_times) * noises
         flows = latents - noises
 
         # predict flow
-        network_output, prediction_tokens = self.network(
+        if self.hp.CFM.Use_CFG:
+            cfg_filters = (torch.rand(
+                encodings.size(0),
+                device= encodings.device
+                )[:, None, None] > self.hp.Train.CFG_Alpha).float()  # [Batch, 1, 1]            
+            encodings = encodings * cfg_filters
+            f0s = f0s * cfg_filters[:, 0, :]
+            prompts = prompts * cfg_filters
+
+        network_outputs, prediction_tokens = self.network.forward(
             noised_latents= noised_latents,
             encodings= encodings,
             f0s= f0s,
             lengths= lengths,
             prompts= prompts,
             prompt_lengths= prompt_lengths,
-            diffusion_steps= cosmap_schedule_times[:, 0, 0], # [Batch]
+            timesteps= schedule_times[:, 0, 0], # [Batch]
             use_token_predictor= True
             )
         
-        if self.hp.Diffusion.Network_Prediction == 'Flow':
-            prediction_flows = network_output
-            prediction_noises = noised_latents - prediction_flows * cosmap_schedule_times.clamp(1e-7)   # is it working?
-        elif self.hp.Diffusion.Network_Prediction == 'Noise':
-            prediction_noises = network_output
-            prediction_flows = (noised_latents - prediction_noises) / cosmap_schedule_times.clamp(1e-7)
+        if self.hp.CFM.Network_Prediction == 'Flow':
+            prediction_flows = network_outputs
+            prediction_noises = noised_latents - prediction_flows * schedule_times.clamp(1e-7)   # is it working?
+        elif self.hp.CFM.Network_Prediction == 'Noise':
+            prediction_noises = network_outputs
+            prediction_flows = (noised_latents - prediction_noises) / schedule_times.clamp(1e-7)
         else:
-            NotImplementedError(f'Unsupported diffusion network prediction type: {self.hp.Diffusion.Network_Prediction}')
+            NotImplementedError(f'Unsupported network prediction type: {self.hp.CFM.Network_Prediction}')
 
-        # prediction_latents = noised_latents + prediction_flows * (1.0 - cosmap_schedule_times)    # not using
+        # prediction_latents = noised_latents + prediction_flows * (1.0 - schedule_times)    # not using
 
         return flows, prediction_flows, noises, prediction_noises, prediction_tokens
     
@@ -73,7 +90,8 @@ class Diffusion(torch.nn.Module):
         lengths: torch.IntTensor,
         prompts: torch.FloatTensor,
         prompt_lengths: torch.IntTensor,
-        steps: int
+        steps: int,
+        cfg_guidance_scale: Optional[float]= 4.0
         ):
         noises = torch.randn(
             encodings.size(0), self.hp.Audio_Codec_Size, encodings.size(2),
@@ -81,28 +99,39 @@ class Diffusion(torch.nn.Module):
             dtype= encodings.dtype
             )  # [Batch, Latent_d, Latent_t]
         
-        def ode_func(diffusion_times: torch.Tensor, noised_latents: torch.Tensor):
-            diffusion_times = diffusion_times[None].expand(noised_latents.size(0))
-            cosmap_schedule_times = self.cosmap_calc(diffusion_times)[:, None, None]
+        def ode_func(timesteps: torch.Tensor, noised_latents: torch.Tensor):
+            timesteps = timesteps[None].expand(noised_latents.size(0))
+            schedule_times = self.timestep_scheduler(timesteps)[:, None, None]
 
             # predict flow
-            network_output, _ = self.network(
+            network_outputs, _ = self.network.forward(
                 noised_latents= noised_latents,
                 encodings= encodings,
                 f0s= f0s,
                 lengths= lengths,
                 prompts= prompts,
                 prompt_lengths= prompt_lengths,
-                diffusion_steps= cosmap_schedule_times[:, 0, 0] # [Batch]
+                timesteps= schedule_times[:, 0, 0] # [Batch]
                 )
+            if self.hp.CFM.Use_CFG:
+                network_outputs_without_condition, _ = self.network.forward(
+                    noised_latents= noised_latents,
+                    encodings= torch.zeros_like(encodings),
+                    f0s= torch.zeros_like(f0s),
+                    lengths= lengths,
+                    prompts= torch.zeros_like(prompts),
+                    prompt_lengths= prompt_lengths,
+                    timesteps= schedule_times[:, 0, 0] # [Batch]
+                    )
+                network_outputs = network_outputs + cfg_guidance_scale * (network_outputs - network_outputs_without_condition)
             
-            if self.hp.Diffusion.Network_Prediction == 'Flow':
-                prediction_flows = network_output                
-            elif self.hp.Diffusion.Network_Prediction == 'Noise':
-                prediction_noises = network_output
-                prediction_flows = (noised_latents - prediction_noises) / cosmap_schedule_times.clamp(1e-7)
+            if self.hp.CFM.Network_Prediction == 'Flow':
+                prediction_flows = network_outputs                
+            elif self.hp.CFM.Network_Prediction == 'Noise':
+                prediction_noises = network_outputs
+                prediction_flows = (noised_latents - prediction_noises) / schedule_times.clamp(1e-7)
             else:
-                NotImplementedError(f'Unsupported diffusion network prediction type: {self.hp.Diffusion.Network_Prediction}')
+                NotImplementedError(f'Unsupported network prediction type: {self.hp.CFM.Network_Prediction}')
 
             return prediction_flows
         
@@ -128,7 +157,7 @@ class Network(torch.nn.Module):
         self.prenet = torch.nn.Sequential(
             Conv_Init(torch.nn.Conv1d(
                 in_channels= self.hp.Audio_Codec_Size,
-                out_channels= self.hp.Diffusion.Size,
+                out_channels= self.hp.CFM.Size,
                 kernel_size= 1,
                 ), w_init_gain= 'gelu'),
             torch.nn.GELU(approximate= 'tanh')
@@ -137,13 +166,13 @@ class Network(torch.nn.Module):
         self.encoding_ffn = torch.nn.Sequential(
             Conv_Init(torch.nn.Conv1d(
                 in_channels= self.hp.Encoder.Size,
-                out_channels= self.hp.Diffusion.Size * 4,
+                out_channels= self.hp.CFM.Size * 4,
                 kernel_size= 1,
                 ), w_init_gain= 'gelu'),
             torch.nn.GELU(approximate= 'tanh'),
             Conv_Init(torch.nn.Conv1d(
-                in_channels= self.hp.Diffusion.Size * 4,
-                out_channels= self.hp.Diffusion.Size,
+                in_channels= self.hp.CFM.Size * 4,
+                out_channels= self.hp.CFM.Size,
                 kernel_size= 1,
                 ), w_init_gain= 'linear')
             )
@@ -152,53 +181,53 @@ class Network(torch.nn.Module):
             Lambda(lambda x: x[:, :, None]),
             Conv_Init(torch.nn.Linear(
                 in_features= 1,
-                out_features= self.hp.Diffusion.Size * 4,
+                out_features= self.hp.CFM.Size * 4,
                 ), w_init_gain= 'gelu'),
             torch.nn.GELU(approximate= 'tanh'),
             Conv_Init(torch.nn.Linear(
-                in_features= self.hp.Diffusion.Size * 4,
-                out_features= self.hp.Diffusion.Size,
+                in_features= self.hp.CFM.Size * 4,
+                out_features= self.hp.CFM.Size,
                 ), w_init_gain= 'linear'),
             Lambda(lambda x: x.mT)
             )
         
         self.step_ffn = torch.nn.Sequential(
             Step_Embedding(
-                embedding_dim= self.hp.Diffusion.Size
+                embedding_dim= self.hp.CFM.Size
                 ),            
             Conv_Init(torch.nn.Linear(
-                in_features= self.hp.Diffusion.Size,
-                out_features= self.hp.Diffusion.Size * 4,
+                in_features= self.hp.CFM.Size,
+                out_features= self.hp.CFM.Size * 4,
                 ), w_init_gain= 'gelu'),
             torch.nn.GELU(approximate= 'tanh'),
             Conv_Init(torch.nn.Linear(
-                in_features= self.hp.Diffusion.Size * 4,
-                out_features= self.hp.Diffusion.Size,
+                in_features= self.hp.CFM.Size * 4,
+                out_features= self.hp.CFM.Size,
                 ), w_init_gain= 'linear'),
             Lambda(lambda x: x[:, :, None])
             )
 
         self.blocks: List[FFT_Block] = torch.nn.ModuleList([
             FFT_Block(
-                channels= self.hp.Diffusion.Size,
-                num_head= self.hp.Diffusion.Transformer.Head,
-                ffn_kernel_size= self.hp.Diffusion.Transformer.FFN.Kernel_Size,
-                ffn_dropout_rate= self.hp.Diffusion.Transformer.FFN.Dropout_Rate,
+                channels= self.hp.CFM.Size,
+                num_head= self.hp.CFM.Transformer.Head,
+                ffn_kernel_size= self.hp.CFM.Transformer.FFN.Kernel_Size,
+                ffn_dropout_rate= self.hp.CFM.Transformer.FFN.Dropout_Rate,
                 norm_type= Norm_Type.Conditional_LayerNorm,
                 condition_channels= self.hp.Encoder.Size,
                 )
-            for _ in range(self.hp.Diffusion.Transformer.Stack)
+            for _ in range(self.hp.CFM.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
 
         self.projection = torch.nn.Sequential(
             Conv_Init(torch.nn.Conv1d(
-                in_channels= self.hp.Diffusion.Size,
-                out_channels= self.hp.Diffusion.Size,
+                in_channels= self.hp.CFM.Size,
+                out_channels= self.hp.CFM.Size,
                 kernel_size= 1
                 ), w_init_gain= 'gelu'),
             torch.nn.GELU(approximate= 'tanh'),
             Conv_Init(torch.nn.Conv1d(
-                in_channels= self.hp.Diffusion.Size,
+                in_channels= self.hp.CFM.Size,
                 out_channels= self.hp.Audio_Codec_Size,
                 kernel_size= 1), w_init_gain= 'zero'),
             )
@@ -213,21 +242,21 @@ class Network(torch.nn.Module):
         lengths: torch.Tensor,        
         prompts: torch.FloatTensor,
         prompt_lengths: torch.IntTensor,
-        diffusion_steps: torch.Tensor,
+        timesteps: torch.Tensor,
         use_token_predictor: bool= False
         ):
         '''
         noised_latents: [Batch, Latent_d, Dec_t]
         encodings: [Batch, Enc_d, Dec_t]
         f0s: [Batch, Dec_t]
-        diffusion_steps: [Batch]
+        timesteps: [Batch]
         '''
         x = self.prenet(noised_latents)
         encodings = self.encoding_ffn(encodings)
         f0s = self.f0_ffn(f0s)
-        diffusion_steps = self.step_ffn(diffusion_steps) # [Batch, Res_d, 1]
+        timesteps = self.step_ffn(timesteps) # [Batch, Res_d, 1]
 
-        x = x + encodings + f0s + diffusion_steps
+        x = x + encodings + f0s + timesteps
 
         for block in self.blocks:
             x = block(
@@ -280,15 +309,15 @@ class Token_Predictor(torch.nn.Module):
         
         self.lstm = torch.nn.LSTM(
             input_size= self.hp.Audio_Codec_Size,
-            hidden_size= self.hp.Diffusion.Token_Predictor.Size,
-            num_layers= self.hp.Diffusion.Token_Predictor.LSTM.Stack,
+            hidden_size= self.hp.CFM.Token_Predictor.Size,
+            num_layers= self.hp.CFM.Token_Predictor.LSTM.Stack,
             )
         self.lstm_dropout = torch.nn.Dropout(
-            p= self.hp.Diffusion.Token_Predictor.LSTM.Dropout_Rate,
+            p= self.hp.CFM.Token_Predictor.LSTM.Dropout_Rate,
             )
 
         self.projection = Conv_Init(torch.nn.Conv1d(
-            in_channels= self.hp.Diffusion.Token_Predictor.Size,
+            in_channels= self.hp.CFM.Token_Predictor.Size,
             out_channels= self.hp.Tokens + 1,
             kernel_size= 1,
             ), w_init_gain= 'linear')

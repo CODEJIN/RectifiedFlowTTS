@@ -23,12 +23,7 @@ from hificodec.vqvae import VQVAE
 from meldataset import mel_spectrogram
 from Arg_Parser import Recursive_Parse, To_Non_Recursive_Dict
 
-# 1. CFG
-# 2. Scheduler
 # 3. Optimal transport
-
-
-
 
 import matplotlib as mpl
 # 유니코드 깨짐현상 해결
@@ -79,6 +74,7 @@ class Trainer:
             self.device = self.accelerator.device
             torch.backends.cudnn.enabled = True
             torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
         
         self.steps = steps
 
@@ -251,6 +247,7 @@ class Trainer:
             fmax= None
             )
 
+
         # if self.accelerator.is_main_process:
         #     logging.info(self.model_dict['RectifiedFlowTTS'])
 
@@ -274,7 +271,7 @@ class Trainer:
             flows, prediction_flows, \
             durations, prediction_durations, prediction_f0s, \
             attention_softs, attention_hards, attention_logprobs, \
-            prediction_speakers, prediction_tokens, _ = self.model_dict['RectifiedFlowTTS'](
+            prediction_speakers, _ = self.model_dict['RectifiedFlowTTS'](
                 tokens= tokens,
                 token_lengths= token_lengths,
                 reference_latent_codes= reference_latent_codes,
@@ -313,12 +310,6 @@ class Trainer:
             loss_dict['Speaker'] = self.criterion_dict['CE'](
                 input= prediction_speakers,
                 target= speakers.long(),
-                )
-            loss_dict['Token'] = self.criterion_dict['TokenCTC'](
-                log_probs= prediction_tokens.permute(2, 0, 1),  # [Latent_t, Batch, Token_n]
-                targets= tokens,
-                input_lengths= latent_code_lengths,
-                target_lengths= token_lengths
                 )
 
             self.optimizer_dict['RectifiedFlowTTS'].zero_grad()
@@ -419,7 +410,7 @@ class Trainer:
         flows, prediction_flows, \
         durations, prediction_durations, prediction_f0s, \
         attention_softs, attention_hards, attention_logprobs, \
-        prediction_speakers, prediction_tokens, alignments = self.model_dict['RectifiedFlowTTS_EMA'](
+        prediction_speakers, alignments = self.model_dict['RectifiedFlowTTS_EMA'](
             tokens= tokens,
             token_lengths= token_lengths,
             reference_latent_codes= reference_latent_codes,
@@ -458,12 +449,6 @@ class Trainer:
         loss_dict['Speaker'] = self.criterion_dict['CE'](
             input= prediction_speakers,
             target= speakers.long(),
-            )
-        loss_dict['Token'] = self.criterion_dict['TokenCTC'](
-            log_probs= prediction_tokens.permute(2, 0, 1),  # [Latent_t, Batch, Token_n]
-            targets= tokens,
-            input_lengths= latent_code_lengths,
-            target_lengths= token_lengths
             )
         
         for tag, loss in loss_dict.items():

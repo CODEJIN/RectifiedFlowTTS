@@ -3,7 +3,9 @@ import math
 from argparse import Namespace
 from typing import Optional, List, Dict, Union
 from tqdm import tqdm
+
 from torchdiffeq import odeint
+from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalFlowMatcher
 
 from .Layer import Conv_Init, Lambda, FFT_Block, Norm_Type
 
@@ -40,16 +42,7 @@ class CFM(torch.nn.Module):
         '''
         encodings: [Batch, Enc_d, Dec_t]
         latents: [Batch, Latent_d, Latent_t]
-        '''
-        selected_times = torch.rand(encodings.size(0), device= encodings.device)   # [Batch]
-        schedule_times = self.timestep_scheduler(selected_times)[:, None, None]
-
-        noises = torch.randn_like(latents)  # [Batch, Latent_d, Latent_t]
-
-        noised_latents = schedule_times * latents + (1.0 - schedule_times) * noises
-        flows = latents - noises
-
-        # predict flow
+        '''        
         if self.hp.CFM.Use_CFG:
             cfg_filters = (torch.rand(
                 encodings.size(0),
@@ -58,30 +51,29 @@ class CFM(torch.nn.Module):
             encodings = encodings * cfg_filters
             f0s = f0s * cfg_filters[:, 0, :]
             prompts = prompts * cfg_filters
+        
+        timesteps = self.timestep_scheduler(
+            torch.rand(encodings.size(0), device= encodings.device)
+            )[:, None, None]
 
-        network_outputs, prediction_tokens = self.network.forward(
+        noises = torch.randn_like(latents)  # [Batch, Latent_d, Latent_t]
+
+        noised_latents = timesteps * latents + (1.0 - timesteps) * noises
+        flows = latents - noises
+
+        # predict flow
+        network_outputs = self.network.forward(
             noised_latents= noised_latents,
             encodings= encodings,
             f0s= f0s,
             lengths= lengths,
             prompts= prompts,
             prompt_lengths= prompt_lengths,
-            timesteps= schedule_times[:, 0, 0], # [Batch]
-            use_token_predictor= True
+            timesteps= timesteps[:, 0, 0]  # [Batch]
             )
-        
-        if self.hp.CFM.Network_Prediction == 'Flow':
-            prediction_flows = network_outputs
-            prediction_noises = noised_latents - prediction_flows * schedule_times.clamp(1e-7)   # is it working?
-        elif self.hp.CFM.Network_Prediction == 'Noise':
-            prediction_noises = network_outputs
-            prediction_flows = (noised_latents - prediction_noises) / schedule_times.clamp(1e-7)
-        else:
-            NotImplementedError(f'Unsupported network prediction type: {self.hp.CFM.Network_Prediction}')
+        prediction_flows = network_outputs
 
-        # prediction_latents = noised_latents + prediction_flows * (1.0 - schedule_times)    # not using
-
-        return flows, prediction_flows, noises, prediction_noises, prediction_tokens
+        return flows, prediction_flows
     
     def Inference(
         self,
@@ -100,48 +92,41 @@ class CFM(torch.nn.Module):
             )  # [Batch, Latent_d, Latent_t]
         
         def ode_func(timesteps: torch.Tensor, noised_latents: torch.Tensor):
-            timesteps = timesteps[None].expand(noised_latents.size(0))
-            schedule_times = self.timestep_scheduler(timesteps)[:, None, None]
+            timesteps = timesteps[None].expand(noised_latents.size(0))  # [Batch]
 
             # predict flow
-            network_outputs, _ = self.network.forward(
+            network_outputs = self.network.forward(
                 noised_latents= noised_latents,
                 encodings= encodings,
                 f0s= f0s,
                 lengths= lengths,
                 prompts= prompts,
                 prompt_lengths= prompt_lengths,
-                timesteps= schedule_times[:, 0, 0] # [Batch]
+                timesteps= timesteps
                 )
             if self.hp.CFM.Use_CFG:
-                network_outputs_without_condition, _ = self.network.forward(
+                network_outputs_without_condition = self.network.forward(
                     noised_latents= noised_latents,
                     encodings= torch.zeros_like(encodings),
                     f0s= torch.zeros_like(f0s),
                     lengths= lengths,
                     prompts= torch.zeros_like(prompts),
                     prompt_lengths= prompt_lengths,
-                    timesteps= schedule_times[:, 0, 0] # [Batch]
+                    timesteps= timesteps
                     )
                 network_outputs = network_outputs + cfg_guidance_scale * (network_outputs - network_outputs_without_condition)
             
-            if self.hp.CFM.Network_Prediction == 'Flow':
-                prediction_flows = network_outputs                
-            elif self.hp.CFM.Network_Prediction == 'Noise':
-                prediction_noises = network_outputs
-                prediction_flows = (noised_latents - prediction_noises) / schedule_times.clamp(1e-7)
-            else:
-                NotImplementedError(f'Unsupported network prediction type: {self.hp.CFM.Network_Prediction}')
+            prediction_flows = network_outputs
 
             return prediction_flows
         
         latents = odeint(
             func= ode_func,
             y0= noises,
-            t= torch.linspace(0.0, 1.0, steps, device= encodings.device),
+            t= self.timestep_scheduler(torch.linspace(0.0, 1.0, steps, device= encodings.device)),
             atol= 1e-5,
             rtol= 1e-5,
-            method= 'midpoint'
+            method= 'dopri5'
             )[-1]
 
         return latents
@@ -232,8 +217,6 @@ class Network(torch.nn.Module):
                 kernel_size= 1), w_init_gain= 'zero'),
             )
 
-        self.token_predictor = Token_Predictor(self.hp)
-
     def forward(
         self,
         noised_latents: torch.Tensor,
@@ -242,8 +225,7 @@ class Network(torch.nn.Module):
         lengths: torch.Tensor,        
         prompts: torch.FloatTensor,
         prompt_lengths: torch.IntTensor,
-        timesteps: torch.Tensor,
-        use_token_predictor: bool= False
+        timesteps: torch.Tensor
         ):
         '''
         noised_latents: [Batch, Latent_d, Dec_t]
@@ -266,13 +248,9 @@ class Network(torch.nn.Module):
                 condition_lengths= prompt_lengths
                 )
 
-        prediction_tokens = None
-        if use_token_predictor:
-            prediction_tokens = self.token_predictor(x)
-
         x = self.projection(x)
 
-        return x, prediction_tokens
+        return x
 
 class Step_Embedding(torch.nn.Module):
     '''
@@ -297,48 +275,6 @@ class Step_Embedding(torch.nn.Module):
         x = torch.cat([x.sin(), x.cos()], dim= 1)
 
         return x
-
-
-class Token_Predictor(torch.nn.Module): 
-    def __init__(
-        self,
-        hyper_parameters: Namespace
-        ):
-        super().__init__()
-        self.hp = hyper_parameters
-        
-        self.lstm = torch.nn.LSTM(
-            input_size= self.hp.Audio_Codec_Size,
-            hidden_size= self.hp.CFM.Token_Predictor.Size,
-            num_layers= self.hp.CFM.Token_Predictor.LSTM.Stack,
-            )
-        self.lstm_dropout = torch.nn.Dropout(
-            p= self.hp.CFM.Token_Predictor.LSTM.Dropout_Rate,
-            )
-
-        self.projection = Conv_Init(torch.nn.Conv1d(
-            in_channels= self.hp.CFM.Token_Predictor.Size,
-            out_channels= self.hp.Tokens + 1,
-            kernel_size= 1,
-            ), w_init_gain= 'linear')
-            
-    def forward(
-        self,
-        encodings: torch.Tensor,
-        ) -> torch.Tensor:
-        '''
-        features: [Batch, Feature_d, Feature_t], Spectrogram
-        lengths: [Batch]
-        '''
-        encodings = encodings.permute(2, 0, 1)    # [Feature_t, Batch, Enc_d]
-        
-        self.lstm.flatten_parameters()
-        encodings = self.lstm(encodings)[0] # [Feature_t, Batch, LSTM_d]
-        
-        predictions = self.projection(encodings.permute(1, 2, 0))
-        predictions = torch.nn.functional.log_softmax(predictions, dim= 1)
-
-        return predictions
 
 
 @torch.jit.script

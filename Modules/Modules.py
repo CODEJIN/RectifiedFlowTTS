@@ -99,7 +99,7 @@ class RectifiedFlowTTS(torch.nn.Module):
             prompt_lengths= reference_latent_code_lengths
             )   # [Batch, Dec_t]
 
-        flows, prediction_flows, _, _, prediction_tokens = self.cfm(
+        flows, prediction_flows = self.cfm(
             encodings= encodings,
             f0s= f0s,
             latents= latents,
@@ -112,7 +112,7 @@ class RectifiedFlowTTS(torch.nn.Module):
             flows, prediction_flows, \
             durations, prediction_durations, prediction_f0s, \
             attention_softs, attention_hards, attention_logprobs, \
-            prediction_speakers, prediction_tokens, alignments
+            prediction_speakers, alignments
     
     def Inference(
         self,

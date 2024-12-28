@@ -79,7 +79,6 @@ CFM:
         LSTM:
             Stack: 2
             Dropout_Rate: 0.0
-    Network_Prediction: 'Flow'   # 'Flow', 'Noise'
     Use_CFG: true
 
 
@@ -157,9 +156,9 @@ Train:
             ]
 
 Inference_Batch_Size: 8
-Inference_Path: './results/VCTK_CFG_Unifrom/Inference'
-Checkpoint_Path: './results/VCTK_CFG_Unifrom/Checkpoint'
-Log_Path: './results/VCTK_CFG_Unifrom/Log'
+Inference_Path: './results/VCTK_CFG_Unifrom_NeuralODE/Inference'
+Checkpoint_Path: './results/VCTK_CFG_Unifrom_NeuralODE/Checkpoint'
+Log_Path: './results/VCTK_CFG_Unifrom_NeuralODE/Log'
 
 Weights_and_Biases:
     Use: false

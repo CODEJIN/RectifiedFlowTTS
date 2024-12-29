@@ -198,10 +198,10 @@ class Network(torch.nn.Module):
                 num_head= self.hp.CFM.Transformer.Head,
                 ffn_kernel_size= self.hp.CFM.Transformer.FFN.Kernel_Size,
                 ffn_dropout_rate= self.hp.CFM.Transformer.FFN.Dropout_Rate,
-                norm_type= Norm_Type.Conditional_LayerNorm,
-                condition_channels= self.hp.Encoder.Size,
+                norm_type= Norm_Type.LayerNorm,
+                cross_attention_condition_channels= self.hp.Encoder.Size if index == 0 else None,
                 )
-            for _ in range(self.hp.CFM.Transformer.Stack)
+            for index in range(self.hp.CFM.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
 
         self.projection = torch.nn.Sequential(
@@ -240,12 +240,12 @@ class Network(torch.nn.Module):
 
         x = x + encodings + f0s + timesteps
 
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks):
             x = block(
                 x= x,
                 lengths= lengths,
-                conditions= prompts,
-                condition_lengths= prompt_lengths
+                cross_attention_conditions= prompts if index == 0 else None,
+                cross_attention_condition_lengths= prompt_lengths if index == 0 else None,
                 )
 
         x = self.projection(x)

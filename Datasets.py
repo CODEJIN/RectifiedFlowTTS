@@ -32,6 +32,14 @@ def F0_Stack(f0s: List[np.ndarray], max_length: int= None):
         )
     return f0s
 
+def Language_Stack(languages: List[List[int]], max_length: Optional[int]= None):
+    max_length = max_length or max([len(language) for language in languages])
+    languages = np.stack(
+        [np.pad(language[:max_length], [0, max_length - len(language[:max_length])], constant_values= 0) for language in languages],
+        axis= 0
+        )
+    return languages
+
 def Mel_Stack(mels: List[np.ndarray], max_length: Optional[int]= None):
     max_mel_length = max_length or max([mel.shape[1] for mel in mels])
     mels = np.stack(
@@ -117,12 +125,13 @@ class Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         path = os.path.join(self.pattern_path, self.patterns[idx]).replace('\\', '/')
-        token, languages, mel, f0, speaker = self.Pattern_LRU_Cache(path)
+        token, language, mel, f0, speaker = self.Pattern_LRU_Cache(path)
 
         attention_prior = self.attention_prior_generator.get_prior(mel.shape[1], token.shape[0])
         reference_mel = pickle.load(open(os.path.join(self.pattern_path, choice(self.file_list_by_speaker[speaker])), 'rb'))['Mel']
+        language = [language] * len(token)
 
-        return token, reference_mel, languages, mel, f0, attention_prior
+        return token, reference_mel, language, mel, f0, attention_prior
     
     def Pattern_LRU_Cache(self, path: str):
         pattern_dict = pickle.load(open(path, 'rb'))
@@ -196,8 +205,9 @@ class Inference_Dataset(torch.utils.data.Dataset):
         else:
             token = pronunciation
         token = Text_to_Token(token, self.token_dict)
+        language = [self.language_dict[language]] * len(token)
 
-        return token, reference_mel, self.language_dict[language], text, pronunciation
+        return token, reference_mel, language, text, pronunciation
 
     def __len__(self):
         return len(self.patterns)
@@ -221,7 +231,7 @@ class Collater:
             token_dict= self.token_dict
             )
         reference_mels = Mel_Stack(mels= reference_mels)
-        languages = np.array(languages)
+        languages = Language_Stack(languages)
         mels = Mel_Stack(mels= mels)
         f0s = F0_Stack(f0s= f0s)
         attention_priors = Attention_Prior_Stack(
@@ -234,7 +244,7 @@ class Collater:
         token_lengths = torch.LongTensor(token_lengths)   # [Batch]
         reference_mels = torch.FloatTensor(reference_mels)  # [Batch, Latent_Code_n, Latent_t]
         reference_mel_lengths = torch.LongTensor(reference_mel_lengths)   # [Batch]
-        languages = torch.LongTensor(languages)   # [Batch]
+        languages = torch.LongTensor(languages)   # [Batch, Token_t]
         mels = torch.FloatTensor(mels)  # [Batch, Mel_d, Latent_t]
         mel_lengths = torch.LongTensor(mel_lengths)   # [Batch]
         f0s = torch.FloatTensor(f0s)    # [Batch, Latent_t]
@@ -257,7 +267,7 @@ class Inference_Collater:
 
         tokens = Token_Stack(tokens, self.token_dict)
         reference_mels = Mel_Stack(reference_mels)
-        languages = np.array(languages)
+        languages = Language_Stack(languages)
 
         tokens = torch.LongTensor(tokens)   # [Batch, Time]
         token_lengths = torch.LongTensor(token_lengths)   # [Batch]

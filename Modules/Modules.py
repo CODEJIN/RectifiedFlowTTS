@@ -19,15 +19,14 @@ class RectifiedFlowTTS(torch.nn.Module):
         self.hp = hyper_parameters
         self.mel_min = mel_min
         self.mel_max = mel_max
-
+        
+        self.prompt_encoder = Prompt_Encoder(self.hp)
         self.encoder = Encoder(self.hp)
         
         self.alignment_learning_framework = Alignment_Learning_Framework(
             feature_size= self.hp.Sound.N_Mel,
             encoding_size= self.hp.Encoder.Size
             )
-        
-        self.prompt_encoder = Prompt_Encoder(self.hp)
 
         self.duration_predictor = Duration_Predictor(self.hp)
         self.f0_predictor = F0_Predictor(self.hp)
@@ -64,12 +63,13 @@ class RectifiedFlowTTS(torch.nn.Module):
             tokens= tokens,
             languages= languages,
             lengths= token_lengths,
-            prompts= prompts,
-            prompt_lengths= reference_mel_lengths
-            )    # [Batch, Enc_d, Enc_t]        
+            )    # [Batch, Enc_d, Enc_t]
 
         durations, attention_softs, attention_hards, attention_logprobs = self.alignment_learning_framework(
-            token_embeddings= self.encoder.token_embedding(tokens).permute(0, 2, 1),
+            token_embeddings= torch.cat([
+                self.encoder.token_embedding(tokens), 
+                self.encoder.language_embedding(languages)
+                ], dim= 2).mT,
             encoding_lengths= token_lengths,
             features= mels,
             feature_lengths= mel_lengths,
@@ -80,12 +80,11 @@ class RectifiedFlowTTS(torch.nn.Module):
             lengths= token_lengths,
             prompts= prompts,
             prompt_lengths= reference_mel_lengths
-            )   # [Batch, Enc_t]
-        
+            )   # [Batch, Enc_t]        
         alignments = self.Length_Regulate(durations)
         encodings = encodings @ alignments  # [Batch, Enc_d, Dec_t]
         
-        encodings = self.frame_prior_network.forward(
+        encodings = self.frame_prior_network(
             encodings= encodings,
             lengths= mel_lengths,
             prompts= prompts,
@@ -135,8 +134,6 @@ class RectifiedFlowTTS(torch.nn.Module):
             tokens= tokens,
             languages= languages,
             lengths= token_lengths,
-            prompts= prompts,
-            prompt_lengths= reference_mel_lengths
             )    # [Batch, Enc_d, Enc_t]
 
         durations = self.duration_predictor(
@@ -146,7 +143,6 @@ class RectifiedFlowTTS(torch.nn.Module):
             prompt_lengths= reference_mel_lengths
             ).ceil().long()   # [Batch, Enc_t]
         alignments = self.Length_Regulate(durations)
-
         encodings = encodings @ alignments  # [Batch, Enc_d, Dec_t]
 
         mel_lengths = torch.stack([
@@ -209,13 +205,13 @@ class Encoder(torch.nn.Module):
 
         self.token_embedding = torch.nn.Embedding(
             num_embeddings= self.hp.Tokens,
-            embedding_dim= self.hp.Encoder.Size,
+            embedding_dim= self.hp.Encoder.Size // 2,
             )
         Embedding_Initialize_(self.token_embedding)
 
         self.language_embedding = torch.nn.Embedding(
             num_embeddings= self.hp.Languages,
-            embedding_dim= self.hp.Encoder.Size,
+            embedding_dim= self.hp.Encoder.Size // 2,
             )
         Embedding_Initialize_(self.language_embedding)
         
@@ -225,10 +221,9 @@ class Encoder(torch.nn.Module):
                 num_head= self.hp.Encoder.Transformer.Head,
                 ffn_kernel_size= self.hp.Encoder.Transformer.FFN.Kernel_Size,
                 ffn_dropout_rate= self.hp.Encoder.Transformer.FFN.Dropout_Rate,
-                norm_type= Norm_Type.Conditional_LayerNorm,
-                condition_channels= self.hp.Encoder.Size,
+                norm_type= Norm_Type.LayerNorm,
                 )
-            for _ in range(self.hp.Encoder.Transformer.Stack)
+            for index in range(self.hp.Encoder.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
 
     def forward(
@@ -236,32 +231,29 @@ class Encoder(torch.nn.Module):
         tokens: torch.FloatTensor,
         languages: torch.LongTensor,
         lengths: torch.LongTensor,
-        prompts: torch.FloatTensor,
-        prompt_lengths: torch.IntTensor
         ) -> torch.FloatTensor:
         '''
         tokens: [Batch, Enc_t]
         languages: [Batch] or [Batch, Enc_t]
         lengths: [Batch], token length
         '''
-        encodings = self.token_embedding(tokens)    # [Batch, Enc_t, Enc_d]
+        masks = None
+        float_masks = 1.0
+        if not lengths is None:
+            masks = Mask_Generate(lengths= lengths, max_length= torch.ones_like(tokens[0]).sum())    # [Batch, Time]
+            float_masks = (~masks)[:, None].float()   # float mask, [Batch, 1, X_t]
 
+        tokens = self.token_embedding(tokens)    # [Batch, Enc_t, Enc_d]
         languages = self.language_embedding(languages)  # [Batch, Enc_d] or [Batch, Enc_t, Enc_d]
-        if languages.ndim == 2:
-            languages = languages[:, None, :]  # [Batch, 1, Enc_d]
-        encodings = encodings + languages
-
-        encodings = encodings.mT # [Batch, Enc_d, Enc_t]        
+        encodings = torch.cat([tokens, languages], dim= 2).mT * float_masks # [Batch, Enc_d, Token_t]
         
         for block in self.blocks:
             encodings = block(
                 x= encodings,
                 lengths= lengths,
-                conditions= prompts,
-                condition_lengths= prompt_lengths
                 )
             
-        return encodings
+        return encodings * float_masks
 
 class Prompt_Encoder(torch.nn.Module):
     def __init__(
@@ -284,8 +276,9 @@ class Prompt_Encoder(torch.nn.Module):
                 num_head= self.hp.Prompter.Transformer.Head,
                 ffn_kernel_size= self.hp.Prompter.Transformer.FFN.Kernel_Size,
                 ffn_dropout_rate= self.hp.Prompter.Transformer.FFN.Dropout_Rate,
+                norm_type= Norm_Type.LayerNorm,
                 )
-            for _ in range(self.hp.Prompter.Transformer.Stack)
+            for index in range(self.hp.Prompter.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
     
     def forward(
@@ -297,13 +290,19 @@ class Prompt_Encoder(torch.nn.Module):
         encodings: [Batch, Enc_d, Enc_t]        
         lengths: [Batch], token length
         '''
+        masks = None
+        float_masks = 1.0
+        if not lengths is None:
+            masks = Mask_Generate(lengths= lengths, max_length= torch.ones_like(mels[0, 0]).sum())    # [Batch, Time]
+            float_masks = (~masks)[:, None].float()   # float mask, [Batch, 1, X_t]
+
         mels = self.prenet(mels)
-        mels = self.gelu(mels)
+        mels = self.gelu(mels) * float_masks
         
         for block in self.blocks:
             mels = block(mels, lengths)
 
-        return mels
+        return mels * float_masks
 
 class Duration_Predictor(torch.nn.Module):
     def __init__(
@@ -319,10 +318,10 @@ class Duration_Predictor(torch.nn.Module):
                 num_head= self.hp.Duration_Predictor.Transformer.Head,
                 ffn_kernel_size= self.hp.Duration_Predictor.Transformer.FFN.Kernel_Size,
                 ffn_dropout_rate= self.hp.Duration_Predictor.Transformer.FFN.Dropout_Rate,
-                norm_type= Norm_Type.Conditional_LayerNorm,
-                condition_channels= self.hp.Encoder.Size,
+                norm_type= Norm_Type.LayerNorm,
+                cross_attention_condition_channels= self.hp.Encoder.Size if index == 0 else None,
                 )
-            for _ in range(self.hp.Duration_Predictor.Transformer.Stack)
+            for index in range(self.hp.Duration_Predictor.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
 
         self.projection = Conv_Init(torch.nn.Conv1d(
@@ -344,12 +343,12 @@ class Duration_Predictor(torch.nn.Module):
         '''
         encodings = encodings.detach()
 
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks):
             encodings = block(
                 x= encodings,
                 lengths= lengths,
-                conditions= prompts,
-                condition_lengths= prompt_lengths
+                cross_attention_conditions= prompts if index == 0 else None,
+                cross_attention_condition_lengths= prompt_lengths if index == 0 else None,
                 )
 
         durations = self.projection(encodings)[:, 0, :] # [Batch, Enc_t]
@@ -370,10 +369,10 @@ class F0_Predictor(torch.nn.Module):
                 num_head= self.hp.F0_Predictor.Transformer.Head,
                 ffn_kernel_size= self.hp.F0_Predictor.Transformer.FFN.Kernel_Size,
                 ffn_dropout_rate= self.hp.F0_Predictor.Transformer.FFN.Dropout_Rate,
-                norm_type= Norm_Type.Conditional_LayerNorm,
-                condition_channels= self.hp.Encoder.Size,
+                norm_type= Norm_Type.LayerNorm,
+                cross_attention_condition_channels= self.hp.Encoder.Size if index == 0 else None,
                 )
-            for _ in range(self.hp.F0_Predictor.Transformer.Stack)
+            for index in range(self.hp.F0_Predictor.Transformer.Stack)
             ])  # real type: torch.nn.ModuleList[FFT_BLock]
         
         self.projection = Conv_Init(torch.nn.Conv1d(
@@ -394,74 +393,20 @@ class F0_Predictor(torch.nn.Module):
         lengths: [Batch], mel length
         '''
         encodings = encodings.detach()
-        
-        for block in self.blocks:
+            
+        for index, block in enumerate(self.blocks):
             encodings = block(
                 x= encodings,
                 lengths= lengths,
-                conditions= prompts,
-                condition_lengths= prompt_lengths
+                cross_attention_conditions= prompts if index == 0 else None,
+                cross_attention_condition_lengths= prompt_lengths if index == 0 else None,
                 )
 
         f0s = self.projection(encodings)[:, 0, :] # [Batch, Dec_t]
 
         return torch.nn.functional.softplus(f0s)
 
-class Eliminator(torch.nn.Module): 
-    def __init__(
-        self,
-        hyper_parameters: Namespace,
-        num_classes: int
-        ):
-        super().__init__()
-        self.hp = hyper_parameters
-        
-        self.grl = GRL()
-
-        self.conv_0 = Conv_Init(torch.nn.Conv1d(
-            in_channels= self.hp.Encoder.Size,
-            out_channels= self.hp.Eliminator.Size,
-            kernel_size= self.hp.Eliminator.Kernel_Size
-            ), w_init_gain= 'relu')
-        self.norm_0 = torch.nn.LayerNorm(self.hp.Eliminator.Size)
-
-        self.conv_1 = Conv_Init(torch.nn.Conv1d(
-            in_channels= self.hp.Eliminator.Size,
-            out_channels= self.hp.Eliminator.Size,
-            kernel_size= self.hp.Eliminator.Kernel_Size
-            ), w_init_gain= 'relu')
-        self.norm_1 = torch.nn.LayerNorm(self.hp.Eliminator.Size)
-
-        self.conv_2 = Conv_Init(torch.nn.Conv1d(
-            in_channels= self.hp.Eliminator.Size,
-            out_channels= self.hp.Eliminator.Size,
-            kernel_size= self.hp.Eliminator.Kernel_Size
-            ), w_init_gain= 'relu')
-        self.norm_2 = torch.nn.LayerNorm(self.hp.Eliminator.Size)
-
-        self.projection = Conv_Init(torch.nn.Linear(
-            in_features= self.hp.Eliminator.Size,
-            out_features= num_classes
-            ), w_init_gain= 'linear')
-
-        self.gelu = torch.nn.GELU(approximate= 'tanh')
-            
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.grl(x)
-        x = self.conv_0(x)
-        x = self.norm_0(x.mT).mT
-        x = self.gelu(x)
-        x = self.conv_1(x)
-        x = self.norm_1(x.mT).mT
-        x = self.gelu(x)
-        x = self.conv_2(x)
-        x = self.norm_2(x.mT).mT
-        x = self.gelu(x).mean(dim= 2)
-        x = self.projection(x)
-
-        return x
-
-class Frame_Prior_Network(torch.nn.Module): 
+class Frame_Prior_Network(torch.nn.Module):
     def __init__(
         self,
         hyper_parameters: Namespace
@@ -475,10 +420,10 @@ class Frame_Prior_Network(torch.nn.Module):
                 num_head= self.hp.Frame_Prior_Network.Transformer.Head,
                 ffn_kernel_size= self.hp.Frame_Prior_Network.Transformer.FFN.Kernel_Size,
                 ffn_dropout_rate= self.hp.Frame_Prior_Network.Transformer.FFN.Dropout_Rate,
-                norm_type= Norm_Type.Conditional_LayerNorm,
-                condition_channels= self.hp.Encoder.Size,
+                norm_type= Norm_Type.LayerNorm,
+                cross_attention_condition_channels= self.hp.Encoder.Size if index == 0 else None,
                 )
-            for _ in range(self.hp.Frame_Prior_Network.Transformer.Stack)
+            for index in range(self.hp.Frame_Prior_Network.Transformer.Stack)
             ])
 
     def forward(
@@ -492,12 +437,12 @@ class Frame_Prior_Network(torch.nn.Module):
         encodings: [Batch, Enc_d, Dec_t],
         lengths: [Batch], mel length
         '''
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks):
             encodings = block(
                 x= encodings,
                 lengths= lengths,
-                conditions= prompts,
-                condition_lengths= prompt_lengths
+                cross_attention_conditions= prompts if index == 0 else None,
+                cross_attention_condition_lengths= prompt_lengths if index == 0 else None,
                 )
         
         return encodings

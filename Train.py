@@ -713,7 +713,7 @@ class Trainer:
                 ]
             if len(paths) > 0:
                 path = max(paths, key = os.path.getctime)
-                self.steps = int(path.split('_')[1])
+                self.steps = int(path.split('_')[-1])
             else:
                 return  # Initial training
         else:

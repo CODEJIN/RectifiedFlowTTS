@@ -34,14 +34,14 @@ class CFM(torch.nn.Module):
         self,
         encodings: torch.FloatTensor,
         f0s: torch.FloatTensor,
-        latents: torch.FloatTensor,
+        mels: torch.FloatTensor,
         lengths: torch.IntTensor,
         prompts: torch.FloatTensor,
         prompt_lengths: torch.IntTensor
         ):
         '''
         encodings: [Batch, Enc_d, Dec_t]
-        latents: [Batch, Latent_d, Latent_t]
+        mels: [Batch, Mel_d, Mel_t]
         '''        
         if self.hp.CFM.Use_CFG:
             cfg_filters = (torch.rand(
@@ -56,14 +56,14 @@ class CFM(torch.nn.Module):
             torch.rand(encodings.size(0), device= encodings.device)
             )[:, None, None]
 
-        noises = torch.randn_like(latents)  # [Batch, Latent_d, Latent_t]
+        noises = torch.randn_like(mels)  # [Batch, Mel_d, Mel_t]
 
-        noised_latents = timesteps * latents + (1.0 - timesteps) * noises
-        flows = latents - noises
+        noised_mels = timesteps * mels + (1.0 - timesteps) * noises
+        flows = mels - noises
 
         # predict flow
         network_outputs = self.network.forward(
-            noised_latents= noised_latents,
+            noised_mels= noised_mels,
             encodings= encodings,
             f0s= f0s,
             lengths= lengths,
@@ -86,17 +86,17 @@ class CFM(torch.nn.Module):
         cfg_guidance_scale: Optional[float]= 4.0
         ):
         noises = torch.randn(
-            encodings.size(0), self.hp.Audio_Codec_Size, encodings.size(2),
+            encodings.size(0), self.hp.Sound.N_Mel, encodings.size(2),
             device= encodings.device,
             dtype= encodings.dtype
-            )  # [Batch, Latent_d, Latent_t]
+            )  # [Batch, Mel_d, Mel_t]
         
-        def ode_func(timesteps: torch.Tensor, noised_latents: torch.Tensor):
-            timesteps = timesteps[None].expand(noised_latents.size(0))  # [Batch]
+        def ode_func(timesteps: torch.Tensor, noised_mels: torch.Tensor):
+            timesteps = timesteps[None].expand(noised_mels.size(0))  # [Batch]
 
             # predict flow
             network_outputs = self.network.forward(
-                noised_latents= noised_latents,
+                noised_mels= noised_mels,
                 encodings= encodings,
                 f0s= f0s,
                 lengths= lengths,
@@ -106,7 +106,7 @@ class CFM(torch.nn.Module):
                 )
             if self.hp.CFM.Use_CFG:
                 network_outputs_without_condition = self.network.forward(
-                    noised_latents= noised_latents,
+                    noised_mels= noised_mels,
                     encodings= torch.zeros_like(encodings),
                     f0s= torch.zeros_like(f0s),
                     lengths= lengths,
@@ -120,7 +120,7 @@ class CFM(torch.nn.Module):
 
             return prediction_flows
         
-        latents = odeint(
+        mels = odeint(
             func= ode_func,
             y0= noises,
             t= self.timestep_scheduler(torch.linspace(0.0, 1.0, steps, device= encodings.device)),
@@ -129,7 +129,7 @@ class CFM(torch.nn.Module):
             method= 'dopri5'
             )[-1]
 
-        return latents
+        return mels
 
 class Network(torch.nn.Module):
     def __init__(
@@ -141,7 +141,7 @@ class Network(torch.nn.Module):
 
         self.prenet = torch.nn.Sequential(
             Conv_Init(torch.nn.Conv1d(
-                in_channels= self.hp.Audio_Codec_Size,
+                in_channels= self.hp.Sound.N_Mel,
                 out_channels= self.hp.CFM.Size,
                 kernel_size= 1,
                 ), w_init_gain= 'gelu'),
@@ -150,7 +150,7 @@ class Network(torch.nn.Module):
         
         self.encoding_ffn = torch.nn.Sequential(
             Conv_Init(torch.nn.Conv1d(
-                in_channels= self.hp.Encoder.Size,
+                in_channels= self.hp.Sound.N_Mel,
                 out_channels= self.hp.CFM.Size * 4,
                 kernel_size= 1,
                 ), w_init_gain= 'gelu'),
@@ -213,13 +213,13 @@ class Network(torch.nn.Module):
             torch.nn.GELU(approximate= 'tanh'),
             Conv_Init(torch.nn.Conv1d(
                 in_channels= self.hp.CFM.Size,
-                out_channels= self.hp.Audio_Codec_Size,
+                out_channels= self.hp.Sound.N_Mel,
                 kernel_size= 1), w_init_gain= 'zero'),
             )
 
     def forward(
         self,
-        noised_latents: torch.Tensor,
+        noised_mels: torch.Tensor,
         encodings: torch.Tensor,
         f0s: torch.Tensor,
         lengths: torch.Tensor,        
@@ -228,12 +228,12 @@ class Network(torch.nn.Module):
         timesteps: torch.Tensor
         ):
         '''
-        noised_latents: [Batch, Latent_d, Dec_t]
+        noised_mels: [Batch, Mel_d, Dec_t]
         encodings: [Batch, Enc_d, Dec_t]
         f0s: [Batch, Dec_t]
         timesteps: [Batch]
         '''
-        x = self.prenet(noised_latents)
+        x = self.prenet(noised_mels)
         encodings = self.encoding_ffn(encodings)
         f0s = self.f0_ffn(f0s)
         timesteps = self.step_ffn(timesteps) # [Batch, Res_d, 1]

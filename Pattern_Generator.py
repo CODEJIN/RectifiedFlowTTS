@@ -13,7 +13,6 @@ from unidecode import unidecode
 from meldataset import mel_spectrogram
 
 from Phonemize import Phonemize, Language, English_Phoneme_Split
-from hificodec.vqvae import VQVAE
 
 from Arg_Parser import Recursive_Parse
 
@@ -29,11 +28,6 @@ if __name__ == '__main__':
         device = torch.device('cpu')
     else:
         device = torch.device('cuda:0')
-    hificodec = VQVAE(
-        config_path= './hificodec/config_24k_320d.json',
-        ckpt_path= './hificodec/HiFi-Codec-24k-320d',
-        with_encoder= True
-        ).to(device)
     
 def Text_Filtering(text):
     remove_letters = ['(', ')', '\"', '[', ']', ':', ';']
@@ -99,7 +93,7 @@ async def Read_audio_and_F0(path: str, sample_rate: int, hop_size: int, f0_min: 
 
 async def Pattern_Generate(
     paths,
-    num_mels: int,
+    n_mels: int,
     sample_rate: int,
     hop_size: int,
     f0_min: int,
@@ -127,76 +121,63 @@ async def Pattern_Generate(
         if not audio is None
         ]
     if len(valid_patterns) == 0:
-        return [None] * len(paths), [None] * len(paths), [None] * len(paths)
+        return [None] * len(paths), [None] * len(paths)
     paths, audios, audio_lengths, f0s = zip(*valid_patterns)
-    latent_lengths: List[int] = [length // hop_size for length in audio_lengths]
+    mel_lengths: List[int] = [length // hop_size for length in audio_lengths]
     audios_tensor = torch.from_numpy(Audio_Stack(audios, max_length= max(audio_lengths))).to(device).float()
     with torch.inference_mode():
-        latent_codes = hificodec.encode(audios_tensor).permute(0, 2, 1).cpu().numpy() # [Batch, 4, Audio_t / 320]
-
         mels = mel_spectrogram(
             y= audios_tensor,
             n_fft= hop_size * 4,
-            num_mels= num_mels,
+            num_mels= n_mels,
             sampling_rate= sample_rate,
             hop_size= hop_size,
             win_size= hop_size * 4,
             fmin= 0,
             fmax= None,
             center= False
-            ).cpu().numpy() # [Batch, 80, Audio_t / 320]
+            ).cpu().numpy()
 
-    latent_codes: List[np.ndarray] = [
-        latent_code[:, :length]
-        for latent_code, length in zip(latent_codes, latent_lengths)
-        ]
     mels: List[np.ndarray] = [
         mel[:, :length]
-        for mel, length in zip(mels, latent_lengths)
+        for mel, length in zip(mels, mel_lengths)
         ]
     
-    latent_codes_trim: List[np.ndarray] = []
     mels_trim: List[np.ndarray] = []
     f0s_trim: List[np.ndarray] = []
-    for latent, mel, f0 in zip(latent_codes, mels, f0s):
-        if abs(latent.shape[1] - f0.shape[0]) > 1:
-            latent_codes_trim.append(None)
+    for mel, f0 in zip(mels, f0s):
+        if abs(mel.shape[1] - f0.shape[0]) > 1:
             mels_trim.append(None)
             f0s_trim.append(None)
             continue
-        elif latent.shape[1] > f0.shape[0]:
-            f0 = np.pad(f0, [0, latent.shape[1] - f0.shape[0]], constant_values= 0.0)
+        elif mel.shape[1] > f0.shape[0]:
+            f0 = np.pad(f0, [0, mel.shape[1] - f0.shape[0]], constant_values= 0.0)
         else:   # mel.shape[1] < f0.shape[0]:
-            latent = np.pad(latent, [[0, 0], [0, f0.shape[0] - latent.shape[1]]], mode= 'edge')
+            mel = np.pad(mel, [[0, 0], [0, f0.shape[0] - mel.shape[1]]], mode= 'edge')
 
         if mel.shape[1] - f0.shape[0] < 0 or mel.shape[1] - f0.shape[0] > 1:
-            latent_codes_trim.append(None)
             mels_trim.append(None)
             f0s_trim.append(None)
             continue
         else:
             mel = mel[:, :f0.shape[0]]
 
-        latent_codes_trim.append(latent.astype(np.int16))
         mels_trim.append(mel.astype(np.float16))
         f0s_trim.append(f0.astype(np.float16))
     
-    latent_codes: List[np.ndarray] = []
     mels: List[np.ndarray] = []
     f0s: List[np.ndarray] = []
     current_index = 0
     for is_valid in is_valid_list:
         if is_valid:
-            latent_codes.append(latent_codes_trim[current_index])
             mels.append(mels_trim[current_index])
             f0s.append(f0s_trim[current_index])
             current_index += 1
         else:
-            latent_codes.append(None)
             mels.append(None)
             f0s.append(None)
     
-    return latent_codes, mels, f0s
+    return mels, f0s
 
 def Pattern_File_Generate(
     paths: List[str],
@@ -239,22 +220,21 @@ def Pattern_File_Generate(
         for file, speaker, dataset in zip(files, speakers, datasets)
         ]
 
-    latent_codes, mels, f0s = asyncio.run(Pattern_Generate(
+    mels, f0s = asyncio.run(Pattern_Generate(
         paths= paths,
-        num_mels= hp.Sound.Num_Mel,
+        n_mels= hp.Sound.N_Mel,
         sample_rate= hp.Sound.Sample_Rate,
         hop_size= hp.Sound.Hop_Size,
         f0_min= hp.Sound.F0_Min,
         f0_max= hp.Sound.F0_Max
         ))
     
-    for file, latent_code, mel, f0, speaker, emotion, language, gender, dataset, text, pronunciation in zip(
-        files, latent_codes, mels, f0s, speakers, emotions, languages, genders, datasets, texts, pronunciations
+    for file, mel, f0, speaker, emotion, language, gender, dataset, text, pronunciation in zip(
+        files, mels, f0s, speakers, emotions, languages, genders, datasets, texts, pronunciations
         ):
-        if latent_code is None:
+        if mel is None:
             continue
         new_pattern_dict = {
-            'Latent_Code': latent_code,
             'Mel': mel,
             'F0': f0,
             'Speaker': speaker,
@@ -1111,7 +1091,6 @@ def Metadata_Generate(eval: bool= False):
     pattern_path = hp.Train.Eval_Pattern.Path if eval else hp.Train.Train_Pattern.Path
     metadata_file = hp.Train.Eval_Pattern.Metadata_File if eval else hp.Train.Train_Pattern.Metadata_File
 
-    latent_dict = {}
     mel_dict = {}
     f0_dict = {}
     speakers = []
@@ -1121,11 +1100,10 @@ def Metadata_Generate(eval: bool= False):
     language_and_gender_dict_by_speaker = {}
 
     new_metadata_dict = {
-        'Num_Mel': hp.Sound.Num_Mel,
+        'N_Mel': hp.Sound.N_Mel,
         'Hop_Size': hp.Sound.Hop_Size,
         'Sample_Rate': hp.Sound.Sample_Rate,
         'File_List': [],
-        'Latent_Length_Dict': {},
         'Mel_Length_Dict': {},
         'F0_Length_Dict': {},
         'Speaker_Dict': {},
@@ -1146,10 +1124,8 @@ def Metadata_Generate(eval: bool= False):
                 continue
             with open(os.path.join(root, file).replace("\\", "/"), "rb") as f:
                 pattern_dict = pickle.load(f)
-
             file = os.path.join(root, file).replace("\\", "/").replace(pattern_path, '').lstrip('/')
 
-            new_metadata_dict['Latent_Length_Dict'][file] = pattern_dict['Latent_Code'].shape[1]
             new_metadata_dict['Mel_Length_Dict'][file] = pattern_dict['Mel'].shape[1]
             new_metadata_dict['F0_Length_Dict'][file] = pattern_dict['F0'].shape[0]
             new_metadata_dict['Speaker_Dict'][file] = pattern_dict['Speaker']
@@ -1161,16 +1137,13 @@ def Metadata_Generate(eval: bool= False):
             new_metadata_dict['File_List_by_Speaker_Dict'][pattern_dict['Speaker']].append(file)
             new_metadata_dict['Text_Length_Dict'][file] = len(pattern_dict['Text'])
 
-            if not pattern_dict['Speaker'] in latent_dict.keys():
-                latent_dict[pattern_dict['Speaker']] = {'Min': math.inf, 'Max': -math.inf}
+            if not pattern_dict['Speaker'] in mel_dict.keys():
+                mel_dict[pattern_dict['Speaker']] = {'Min': math.inf, 'Max': -math.inf}
             if not pattern_dict['Speaker'] in mel_dict.keys():
                 mel_dict[pattern_dict['Speaker']] = {'Min': math.inf, 'Max': -math.inf}
             if not pattern_dict['Speaker'] in f0_dict.keys():
                 f0_dict[pattern_dict['Speaker']] = []
             
-            latent = hificodec.quantizer.embed(torch.from_numpy(pattern_dict['Latent_Code']).T[None].long().to(device))[0].cpu()
-            latent_dict[pattern_dict['Speaker']]['Min'] = min(latent_dict[pattern_dict['Speaker']]['Min'], latent.min().item())
-            latent_dict[pattern_dict['Speaker']]['Max'] = max(latent_dict[pattern_dict['Speaker']]['Max'], latent.max().item())
             mel_dict[pattern_dict['Speaker']]['Min'] = min(mel_dict[pattern_dict['Speaker']]['Min'], pattern_dict['Mel'].min().item())
             mel_dict[pattern_dict['Speaker']]['Max'] = max(mel_dict[pattern_dict['Speaker']]['Max'], pattern_dict['Mel'].max().item())
 
@@ -1190,10 +1163,6 @@ def Metadata_Generate(eval: bool= False):
         pickle.dump(new_metadata_dict, f, protocol= 4)
 
     if not eval:
-        yaml.dump(
-            latent_dict,
-            open(hp.Latent_Info_Path, 'w')
-            )
         yaml.dump(
             mel_dict,
             open(hp.Mel_Info_Path, 'w')

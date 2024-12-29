@@ -18,7 +18,6 @@ from typing import List
 from Modules.Modules import RectifiedFlowTTS, Mask_Generate
 from Modules.Nvidia_Alignment_Learning_Framework import AttentionBinarizationLoss, AttentionCTCLoss
 from Datasets import Dataset, Inference_Dataset, Collater, Inference_Collater
-from hificodec.vqvae import VQVAE
 
 from meldataset import mel_spectrogram
 from Arg_Parser import Recursive_Parse, To_Non_Recursive_Dict
@@ -55,11 +54,6 @@ class Trainer:
             open(self.hp_path, encoding='utf-8'),
             Loader=yaml.Loader
             ))
-        self.hificodec = VQVAE(
-            config_path= './hificodec/config_24k_320d.json',
-            ckpt_path= './hificodec/HiFi-Codec-24k-320d',
-            with_encoder= True
-            )
 
         self.accelerator = Accelerator(
             split_batches= True,
@@ -127,8 +121,8 @@ class Trainer:
             use_between_padding= self.hp.Use_Between_Padding,
             pattern_path= self.hp.Train.Train_Pattern.Path,
             metadata_file= self.hp.Train.Train_Pattern.Metadata_File,
-            latent_length_min= self.hp.Train.Train_Pattern.Feature_Length.Min,
-            latent_length_max= self.hp.Train.Train_Pattern.Feature_Length.Max,
+            mel_length_min= self.hp.Train.Train_Pattern.Feature_Length.Min,
+            mel_length_max= self.hp.Train.Train_Pattern.Feature_Length.Max,
             text_length_min= self.hp.Train.Train_Pattern.Text_Length.Min,
             text_length_max= self.hp.Train.Train_Pattern.Text_Length.Max,
             accumulated_dataset_epoch= self.hp.Train.Train_Pattern.Accumulated_Dataset_Epoch,
@@ -142,8 +136,8 @@ class Trainer:
             use_between_padding= self.hp.Use_Between_Padding,
             pattern_path= self.hp.Train.Eval_Pattern.Path,
             metadata_file= self.hp.Train.Eval_Pattern.Metadata_File,
-            latent_length_min= self.hp.Train.Train_Pattern.Feature_Length.Min,
-            latent_length_max= self.hp.Train.Eval_Pattern.Feature_Length.Max,
+            mel_length_min= self.hp.Train.Train_Pattern.Feature_Length.Min,
+            mel_length_max= self.hp.Train.Eval_Pattern.Feature_Length.Max,
             text_length_min= self.hp.Train.Eval_Pattern.Text_Length.Min,
             text_length_max= self.hp.Train.Eval_Pattern.Text_Length.Max,
             use_pattern_cache= self.hp.Train.Pattern_Cache
@@ -151,9 +145,9 @@ class Trainer:
         inference_dataset = Inference_Dataset(
             token_dict= token_dict,
             language_dict= language_dict,
-            codec= self.hificodec,
-            hop_size= self.hp.Sound.Hop_Size,
             sample_rate= self.hp.Sound.Sample_Rate,
+            hop_size= self.hp.Sound.Hop_Size,
+            n_mels= self.hp.Sound.N_Mel,
             use_between_padding= self.hp.Use_Between_Padding,
             texts= self.hp.Train.Inference_in_Train.Text,
             reference_paths= self.hp.Train.Inference_in_Train.Reference,
@@ -199,8 +193,16 @@ class Trainer:
             )
 
     def Model_Generate(self):
+        mel_dict = yaml.load(open(self.hp.Mel_Info_Path, encoding= 'utf-8-sig'), Loader=yaml.Loader)
+        mel_min, mel_max = zip(*[(x['Min'], x['Max']) for x in mel_dict.values()])
+        mel_min, mel_max = min(mel_min), max(mel_max)
+
         self.model_dict = {
-            'RectifiedFlowTTS': RectifiedFlowTTS(self.hp, self.hificodec).to(self.device)
+            'RectifiedFlowTTS': RectifiedFlowTTS(
+                self.hp,
+                mel_min= mel_min,
+                mel_max= mel_max
+                ).to(self.device)
             }
         self.model_dict['RectifiedFlowTTS_EMA'] = torch.optim.swa_utils.AveragedModel(
             self.model_dict['RectifiedFlowTTS'],
@@ -213,10 +215,6 @@ class Trainer:
             'CE': torch.nn.CrossEntropyLoss().to(self.device),
             'Attention_Binarization': AttentionBinarizationLoss(),
             'Attention_CTC': AttentionCTCLoss(),
-            'TokenCTC': torch.nn.CTCLoss(
-                blank= self.hp.Tokens,  # == Token length
-                zero_infinity= True
-                ),
             }
 
         self.optimizer_dict = {
@@ -235,18 +233,8 @@ class Trainer:
                 last_epoch= -1
                 )
             }
-        
-        self.mel_func = partial(
-            mel_spectrogram,
-            n_fft= self.hp.Sound.N_FFT,
-            num_mels= self.hp.Sound.Num_Mel,
-            sampling_rate= self.hp.Sound.Sample_Rate,
-            hop_size= self.hp.Sound.Hop_Size,
-            win_size= self.hp.Sound.Hop_Size * 4,
-            fmin= 0,
-            fmax= None
-            )
 
+        self.vocoder = torch.jit.load('BigVGAN_24K_100band_256x.pts', map_location= 'cpu').to(self.device)
 
         # if self.accelerator.is_main_process:
         #     logging.info(self.model_dict['RectifiedFlowTTS'])
@@ -255,32 +243,30 @@ class Trainer:
         self,
         tokens: torch.IntTensor,
         token_lengths: torch.IntTensor,
-        reference_latent_codes: torch.IntTensor,
-        reference_latent_code_lengths: torch.IntTensor,
+        reference_mels: torch.IntTensor,
+        reference_mel_lengths: torch.IntTensor,
         languages: torch.IntTensor,
-        latent_codes: torch.IntTensor,
-        latent_code_lengths: torch.IntTensor,
-        f0s: torch.FloatTensor,
         mels: torch.FloatTensor,
-        speakers: torch.IntTensor,
+        mel_lengths: torch.IntTensor,
+        f0s: torch.FloatTensor,
         attention_priors: torch.FloatTensor
         ):
         loss_dict = {}
 
         with self.accelerator.accumulate(self.model_dict['RectifiedFlowTTS']):
             flows, prediction_flows, \
+            target_mels, linear_prediction_mels, \
             durations, prediction_durations, prediction_f0s, \
             attention_softs, attention_hards, attention_logprobs, \
-            prediction_speakers, _ = self.model_dict['RectifiedFlowTTS'](
+            _ = self.model_dict['RectifiedFlowTTS'](
                 tokens= tokens,
                 token_lengths= token_lengths,
-                reference_latent_codes= reference_latent_codes,
-                reference_latent_code_lengths= reference_latent_code_lengths,
+                reference_mels= reference_mels,
+                reference_mel_lengths= reference_mel_lengths,
                 languages= languages,
-                latent_codes= latent_codes,
-                latent_code_lengths= latent_code_lengths,
-                f0s= f0s,
                 mels= mels,
+                mel_lengths= mel_lengths,
+                f0s= f0s,
                 attention_priors= attention_priors
                 )
             
@@ -288,17 +274,21 @@ class Trainer:
                 lengths= token_lengths,
                 max_length= tokens.size(1)
                 ).to(tokens.device)
-            latent_masks = ~Mask_Generate(
-                lengths= latent_code_lengths,
-                max_length= latent_codes.size(2)
-                ).to(latent_codes.device)[:, None, :]
+            mel_masks = ~Mask_Generate(
+                lengths= mel_lengths,
+                max_length= mels.size(2)
+                ).to(mels.device)[:, None, :]
             
             loss_dict['CFM'] = (self.criterion_dict['MSE'](
                 prediction_flows,
                 flows,
-                ) * latent_masks).sum() / latent_masks.sum() / prediction_flows.size(1)
+                ) * mel_masks).sum() / mel_masks.sum() / prediction_flows.size(1)
+            loss_dict['Encoding'] = (self.criterion_dict['MSE'](
+                linear_prediction_mels,
+                target_mels,
+                ) * mel_masks).sum() / mel_masks.sum() / prediction_flows.size(1)
             loss_dict['Attention_Binarization'] = self.criterion_dict['Attention_Binarization'](attention_hards, attention_softs)
-            loss_dict['Attention_CTC'] = self.criterion_dict['Attention_CTC'](attention_logprobs, token_lengths, latent_code_lengths)            
+            loss_dict['Attention_CTC'] = self.criterion_dict['Attention_CTC'](attention_logprobs, token_lengths, mel_lengths)            
             loss_dict['Duration'] = (self.criterion_dict['MSE'](
                 (prediction_durations + 1).log(),
                 (durations + 1).log(),
@@ -306,20 +296,16 @@ class Trainer:
             loss_dict['F0'] = (self.criterion_dict['MSE'](
                 (prediction_f0s + 1).log(),
                 (f0s + 1).log(),
-                ) * latent_masks).sum() / latent_masks.sum()
-            loss_dict['Speaker'] = self.criterion_dict['CE'](
-                input= prediction_speakers,
-                target= speakers.long(),
-                )
-
+                ) * mel_masks).sum() / mel_masks.sum()
+            
             self.optimizer_dict['RectifiedFlowTTS'].zero_grad()
             self.accelerator.backward(
                 loss_dict['CFM'] +
+                loss_dict['Encoding'] +
                 loss_dict['Attention_Binarization'] +
                 loss_dict['Attention_CTC'] +
                 loss_dict['Duration'] +
                 loss_dict['F0']
-                # loss_dict['Speaker']
                 )
 
             if self.hp.Train.Gradient_Norm > 0.0:
@@ -341,19 +327,17 @@ class Trainer:
             self.scalar_dict['Train']['Loss/{}'.format(tag)] += loss.item()
 
     def Train_Epoch(self):
-        for tokens, token_lengths, reference_latent_codes, reference_latent_code_lengths, languages, \
-            latent_codes, latent_code_lengths, f0s, mels, speakers, attention_priors in self.dataloader_dict['Train']:
+        for tokens, token_lengths, reference_mels, reference_mel_lengths, languages, \
+            mels, mel_lengths, f0s, attention_priors in self.dataloader_dict['Train']:
             self.Train_Step(
                 tokens= tokens,
                 token_lengths= token_lengths,
-                reference_latent_codes= reference_latent_codes,
-                reference_latent_code_lengths= reference_latent_code_lengths,
+                reference_mels= reference_mels,
+                reference_mel_lengths= reference_mel_lengths,
                 languages= languages,
-                latent_codes= latent_codes,
-                latent_code_lengths= latent_code_lengths,
-                f0s= f0s,
                 mels= mels,
-                speakers= speakers,
+                mel_lengths= mel_lengths,
+                f0s= f0s,
                 attention_priors= attention_priors
                 )
 
@@ -395,31 +379,29 @@ class Trainer:
         self,
         tokens: torch.IntTensor,
         token_lengths: torch.IntTensor,
-        reference_latent_codes: torch.IntTensor,
-        reference_latent_code_lengths: torch.IntTensor,
+        reference_mels: torch.IntTensor,
+        reference_mel_lengths: torch.IntTensor,
         languages: torch.IntTensor,
-        latent_codes: torch.IntTensor,
-        latent_code_lengths: torch.IntTensor,
-        f0s: torch.FloatTensor,
         mels: torch.FloatTensor,
-        speakers: torch.IntTensor,
+        mel_lengths: torch.IntTensor,
+        f0s: torch.FloatTensor,
         attention_priors: torch.FloatTensor
         ):
         loss_dict = {}
 
         flows, prediction_flows, \
+        target_mels, linear_prediction_mels, \
         durations, prediction_durations, prediction_f0s, \
         attention_softs, attention_hards, attention_logprobs, \
-        prediction_speakers, alignments = self.model_dict['RectifiedFlowTTS_EMA'](
+        alignments = self.model_dict['RectifiedFlowTTS_EMA'](
             tokens= tokens,
             token_lengths= token_lengths,
-            reference_latent_codes= reference_latent_codes,
-            reference_latent_code_lengths= reference_latent_code_lengths,
+            reference_mels= reference_mels,
+            reference_mel_lengths= reference_mel_lengths,
             languages= languages,
-            latent_codes= latent_codes,
-            latent_code_lengths= latent_code_lengths,
-            f0s= f0s,
             mels= mels,
+            mel_lengths= mel_lengths,
+            f0s= f0s,
             attention_priors= attention_priors
             )
 
@@ -427,17 +409,21 @@ class Trainer:
             lengths= token_lengths,
             max_length= tokens.size(1)
             ).to(tokens.device)
-        latent_masks = ~Mask_Generate(
-            lengths= latent_code_lengths,
-            max_length= latent_codes.size(2)
-            ).to(latent_codes.device)[:, None, :]
+        mel_masks = ~Mask_Generate(
+            lengths= mel_lengths,
+            max_length= mels.size(2)
+            ).to(mels.device)[:, None, :]
         
         loss_dict['CFM'] = (self.criterion_dict['MSE'](
             prediction_flows,
             flows,
-            ) * latent_masks).sum() / latent_masks.sum() / prediction_flows.size(1)
+            ) * mel_masks).sum() / mel_masks.sum() / prediction_flows.size(1)
+        loss_dict['Encoding'] = (self.criterion_dict['MSE'](
+            linear_prediction_mels,
+            target_mels,
+            ) * mel_masks).sum() / mel_masks.sum() / prediction_flows.size(1)
         loss_dict['Attention_Binarization'] = self.criterion_dict['Attention_Binarization'](attention_hards, attention_softs)
-        loss_dict['Attention_CTC'] = self.criterion_dict['Attention_CTC'](attention_logprobs, token_lengths, latent_code_lengths)            
+        loss_dict['Attention_CTC'] = self.criterion_dict['Attention_CTC'](attention_logprobs, token_lengths, mel_lengths)            
         loss_dict['Duration'] = (self.criterion_dict['MSE'](
             (prediction_durations + 1).log(),
             (durations + 1).log(),
@@ -445,11 +431,7 @@ class Trainer:
         loss_dict['F0'] = (self.criterion_dict['MSE'](
             (prediction_f0s + 1).log(),
             (f0s + 1).log(),
-            ) * latent_masks).sum() / latent_masks.sum()     
-        loss_dict['Speaker'] = self.criterion_dict['CE'](
-            input= prediction_speakers,
-            target= speakers.long(),
-            )
+            ) * mel_masks).sum() / mel_masks.sum()
         
         for tag, loss in loss_dict.items():
             self.scalar_dict['Evaluation']['Loss/{}'.format(tag)] += loss.item()
@@ -462,8 +444,8 @@ class Trainer:
         for model in self.model_dict.values():
             model.eval()
 
-        for step, (tokens, token_lengths, reference_latent_codes, reference_latent_code_lengths, languages,
-            latent_codes, latent_code_lengths, f0s, mels, speakers, attention_priors) in tqdm(
+        for step, (tokens, token_lengths, reference_mels, reference_mel_lengths, languages,
+            mels, mel_lengths, f0s, attention_priors) in tqdm(
             enumerate(self.dataloader_dict['Eval'], 1),
             desc='[Evaluation]',
             total= math.ceil(len(self.dataloader_dict['Eval'].dataset) / self.hp.Train.Batch_Size / self.num_gpus)
@@ -471,14 +453,12 @@ class Trainer:
             alignments = self.Evaluation_Step(
                 tokens= tokens,
                 token_lengths= token_lengths,
-                reference_latent_codes= reference_latent_codes,
-                reference_latent_code_lengths= reference_latent_code_lengths,
+                reference_mels= reference_mels,
+                reference_mel_lengths= reference_mel_lengths,
                 languages= languages,
-                latent_codes= latent_codes,
-                latent_code_lengths= latent_code_lengths,
-                f0s= f0s,
                 mels= mels,
-                speakers= speakers,
+                mel_lengths= mel_lengths,
+                f0s= f0s,
                 attention_priors= attention_priors
                 )
 
@@ -494,44 +474,44 @@ class Trainer:
 
             with torch.inference_mode():
                 if self.num_gpus > 1:
-                    target_audios = self.model_dict['RectifiedFlowTTS_EMA'].module.module.hificodec(latent_codes[index, None].mT.to(self.device))[:, 0]
                     inference_func = self.model_dict['RectifiedFlowTTS_EMA'].module.module.Inference
                 else:
-                    target_audios = self.model_dict['RectifiedFlowTTS_EMA'].module.hificodec(latent_codes[index, None].mT.to(self.device))[:, 0]
                     inference_func = self.model_dict['RectifiedFlowTTS_EMA'].Inference
 
-                prediction_audios, prediction_f0s, prediction_alignments = inference_func(
+                prediction_mels, prediction_f0s, prediction_alignments, linear_prediction_mels = inference_func(
                     tokens= tokens[index, None].to(self.device),
                     token_lengths= token_lengths[index, None].to(self.device),
-                    reference_latent_codes= reference_latent_codes[index, None].to(self.device),
-                    reference_latent_code_lengths= reference_latent_code_lengths[index, None].to(self.device),
+                    reference_mels= reference_mels[index, None].to(self.device),
+                    reference_mel_lengths= reference_mel_lengths[index, None].to(self.device),
                     languages= languages[index, None].to(self.device),
                     )
 
             token_length = token_lengths[index].item()
-            target_latent_length = latent_code_lengths[index].item()
-            prediction_latent_length = prediction_alignments[0, :token_length, :].sum().long().item()
-            target_audio_length = target_latent_length * self.hp.Sound.Hop_Size
-            prediction_audio_length = prediction_latent_length * self.hp.Sound.Hop_Size
+            target_mel_length = mel_lengths[index].item()
+            prediction_mel_length = prediction_alignments[0, :token_length, :].sum().long().item()
 
-            target_audio = target_audios[0, :target_audio_length].float().clamp(-1.0, 1.0)
-            prediction_audio = prediction_audios[0, :prediction_audio_length].float().clamp(-1.0, 1.0)
+            target_mel = mels[index, :, :target_mel_length]
+            prediction_mel = prediction_mels[0, :, :prediction_mel_length]
+            linear_prediction_mel = linear_prediction_mels[0, :, :prediction_mel_length]
 
-            target_mel = self.mel_func(target_audio[None])[0].cpu().numpy()
-            prediction_mel = self.mel_func(prediction_audio[None])[0].cpu().numpy()
+            target_audio = self.vocoder(target_mel[None])[0].float().clamp(-1.0, 1.0).cpu().numpy()
+            prediction_audio = self.vocoder(prediction_mel[None])[0].float().clamp(-1.0, 1.0).cpu().numpy()
+            linear_prediction_audio = self.vocoder(linear_prediction_mel[None])[0].float().clamp(-1.0, 1.0).cpu().numpy()
 
-            target_audio = target_audio.cpu().numpy()
-            prediction_audio = prediction_audio.cpu().numpy()
+            target_mel = target_mel.cpu().numpy()
+            prediction_mel = prediction_mel.cpu().numpy()
+            linear_prediction_mel = linear_prediction_mel.cpu().numpy()
 
-            target_f0 = f0s[index, :target_latent_length].cpu().numpy() 
-            prediction_f0 = prediction_f0s[0, :prediction_latent_length].cpu().numpy()
+            target_f0 = f0s[index, :target_mel_length].cpu().numpy() 
+            prediction_f0 = prediction_f0s[0, :prediction_mel_length].cpu().numpy()
 
-            target_alignment = alignments[index, :token_length, :target_latent_length].cpu().numpy()
-            prediction_alignment = prediction_alignments[0, :token_length, :prediction_latent_length].cpu().numpy()
+            target_alignment = alignments[index, :token_length, :target_mel_length].cpu().numpy()
+            prediction_alignment = prediction_alignments[0, :token_length, :prediction_mel_length].cpu().numpy()
 
             image_dict = {
                 'Mel/Target': (target_mel, None, 'auto', None, None, None),
                 'Mel/Prediction': (prediction_mel, None, 'auto', None, None, None),
+                'Mel/Linear': (linear_prediction_mel, None, 'auto', None, None, None),
                 'F0/Target': (target_f0, None, 'auto', None, None, None),
                 'F0/Prediction': (prediction_f0, None, 'auto', None, None, None),
                 'Alignment/Target': (target_alignment, None, 'auto', None, None, None),
@@ -539,7 +519,8 @@ class Trainer:
                 }
             audio_dict = {
                 'Audio/Target': (target_audio, self.hp.Sound.Sample_Rate),
-                'Audio/Linear': (prediction_audio, self.hp.Sound.Sample_Rate),
+                'Audio/Prediction': (prediction_audio, self.hp.Sound.Sample_Rate),
+                'Audio/Linear': (linear_prediction_audio, self.hp.Sound.Sample_Rate),
                 }
 
             self.writer_dict['Evaluation'].add_image_dict(image_dict, self.steps)
@@ -558,6 +539,7 @@ class Trainer:
                     data= {
                         'Evaluation.Mel.Target': wandb.Image(target_mel),
                         'Evaluation.Mel.Prediction': wandb.Image(prediction_mel),
+                        'Evaluation.Mel.Linear': wandb.Image(linear_prediction_mel),
                         'Evaluation.Audio.Target': wandb.Audio(
                             target_audio,
                             sample_rate= self.hp.Sound.Sample_Rate,
@@ -567,6 +549,11 @@ class Trainer:
                             prediction_audio,
                             sample_rate= self.hp.Sound.Sample_Rate,
                             caption= 'Prediction_Audio'
+                            ),
+                        'Evaluation.Audio.Linear': wandb.Audio(
+                            linear_prediction_audio,
+                            sample_rate= self.hp.Sound.Sample_Rate,
+                            caption= 'Linear_Prediction_Audio'
                             ),
                         },
                     step= self.steps,
@@ -584,8 +571,8 @@ class Trainer:
         self,
         tokens: torch.IntTensor,
         token_lengths: torch.IntTensor,
-        reference_latent_codes: torch.IntTensor,
-        reference_latent_code_lengths: torch.IntTensor,
+        reference_mels: torch.IntTensor,
+        reference_mel_lengths: torch.IntTensor,
         languages: torch.IntTensor,
         texts: List[str],
         pronunciations: List[str],
@@ -597,39 +584,38 @@ class Trainer:
         else:
             inference_func = self.model_dict['RectifiedFlowTTS_EMA'].Inference
 
-        prediction_audios, prediction_f0s, prediction_alignments = inference_func(
+        prediction_mels, prediction_f0s, prediction_alignments, _ = inference_func(
             tokens= tokens,
             token_lengths= token_lengths,
-            reference_latent_codes= reference_latent_codes,
-            reference_latent_code_lengths= reference_latent_code_lengths,
+            reference_mels= reference_mels,
+            reference_mel_lengths= reference_mel_lengths,
             languages= languages,
             )
-        latent_code_lengths = [
+        mel_lengths = [
             alignment[:token_length, :].sum().long().item()
             for token_length, alignment in zip(token_lengths, prediction_alignments)
             ]
         audio_lengths = [
             length * self.hp.Sound.Hop_Size
-            for length in latent_code_lengths
+            for length in mel_lengths
             ]
 
         prediction_alignments = [
             alignment[:token_length, :mel_length]
-            for alignment, token_length, mel_length in zip(prediction_alignments.cpu().numpy(), token_lengths, latent_code_lengths)
+            for alignment, token_length, mel_length in zip(prediction_alignments.cpu().numpy(), token_lengths, mel_lengths)
             ]
 
-        prediction_mels = [
-            mel[:, :length]
-            for mel, length in zip(self.mel_func(prediction_audios).cpu().numpy(), latent_code_lengths)
-            ]
         prediction_audios = [
             audio[:length]
-            for audio, length in zip(prediction_audios.cpu().numpy(), audio_lengths)
+            for audio, length in zip(self.vocoder(prediction_mels).cpu().numpy(), audio_lengths)
             ]
-        
+        prediction_mels = [
+            mel[:, :length]
+            for mel, length in zip(prediction_mels.cpu().numpy(), mel_lengths)
+            ]        
         prediction_f0s = [
             f0[:length]
-            for f0, length in zip(prediction_f0s.cpu().numpy(), latent_code_lengths)
+            for f0, length in zip(prediction_f0s.cpu().numpy(), mel_lengths)
             ]
 
         files = []
@@ -697,7 +683,7 @@ class Trainer:
             model.eval()
 
         batch_size = self.hp.Inference_Batch_Size or self.hp.Train.Batch_Size
-        for step, (tokens, token_lengths, reference_latent_codes, reference_latent_code_lengths, languages, texts, pronunciations) in tqdm(
+        for step, (tokens, token_lengths, reference_mels, reference_mel_lengths, languages, texts, pronunciations) in tqdm(
             enumerate(self.dataloader_dict['Inference']),
             desc='[Inference]',
             total= math.ceil(len(self.dataloader_dict['Inference'].dataset) / batch_size)
@@ -705,8 +691,8 @@ class Trainer:
             self.Inference_Step(
                 tokens= tokens,
                 token_lengths= token_lengths,
-                reference_latent_codes= reference_latent_codes,
-                reference_latent_code_lengths= reference_latent_code_lengths,
+                reference_mels= reference_mels,
+                reference_mel_lengths= reference_mel_lengths,
                 languages= languages,
                 texts= texts,
                 pronunciations= pronunciations,

@@ -13,3 +13,4 @@ dac/
 VCTK_Load.pickle
 Libri_Load.pickle
 demo.py
+BigVGAN_24K_100band_256x.pts

@@ -8,21 +8,22 @@ from .Layer import Conv_Init, Embedding_Initialize_, FFT_Block, Norm_Type
 from .GRL import GRL
 from .CFM import CFM
 
-from hificodec.vqvae import VQVAE
-
 class RectifiedFlowTTS(torch.nn.Module):
     def __init__(
         self,
         hyper_parameters: Namespace,
-        hificodec: VQVAE
+        mel_min: float,
+        mel_max: float
         ):
         super().__init__()
         self.hp = hyper_parameters
+        self.mel_min = mel_min
+        self.mel_max = mel_max
 
         self.encoder = Encoder(self.hp)
         
         self.alignment_learning_framework = Alignment_Learning_Framework(
-            feature_size= self.hp.Sound.Num_Mel,
+            feature_size= self.hp.Sound.N_Mel,
             encoding_size= self.hp.Encoder.Size
             )
         
@@ -30,158 +31,157 @@ class RectifiedFlowTTS(torch.nn.Module):
 
         self.duration_predictor = Duration_Predictor(self.hp)
         self.f0_predictor = F0_Predictor(self.hp)
-        self.speaker_eliminator = Eliminator(self.hp, self.hp.Speakers)
 
         self.frame_prior_network = Frame_Prior_Network(self.hp)
+        self.linear_projection = Conv_Init(torch.nn.Conv1d(
+            in_channels= self.hp.Encoder.Size,
+            out_channels= self.hp.Sound.N_Mel,
+            kernel_size= 1
+            ), w_init_gain= 'linear')
 
         self.cfm = CFM(self.hp)
-
-        self.hificodec = hificodec
-        self.hificodec.eval()
 
     def forward(
         self,
         tokens: torch.LongTensor,
         token_lengths: torch.LongTensor,
-        reference_latent_codes: torch.LongTensor,
-        reference_latent_code_lengths: torch.LongTensor,
+        reference_mels: torch.LongTensor,
+        reference_mel_lengths: torch.LongTensor,
         languages: torch.LongTensor,
-        latent_codes: torch.LongTensor,
-        latent_code_lengths: torch.LongTensor,
+        mels: torch.LongTensor,
+        mel_lengths: torch.LongTensor,
         f0s: torch.FloatTensor,
-        mels: torch.FloatTensor,
         attention_priors: torch.FloatTensor
         ):
-        with torch.no_grad():
-            latents = self.hificodec.quantizer.embed(latent_codes.mT).detach()
-            reference_latents = self.hificodec.quantizer.embed(reference_latent_codes.mT).detach()
+        target_mels = (mels - self.mel_min) / (self.mel_max - self.mel_min) * 2.0 - 1.0
+        reference_mels = (reference_mels - self.mel_min) / (self.mel_max - self.mel_min) * 2.0 - 1.0
 
         prompts = self.prompt_encoder(
-            latents= reference_latents,
-            lengths= reference_latent_code_lengths,
+            mels= reference_mels,
+            lengths= reference_mel_lengths,
             )    # [Batch, Enc_d, Prompt_t]
         encodings = self.encoder(
             tokens= tokens,
             languages= languages,
             lengths= token_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             )    # [Batch, Enc_d, Enc_t]        
 
         durations, attention_softs, attention_hards, attention_logprobs = self.alignment_learning_framework(
             token_embeddings= self.encoder.token_embedding(tokens).permute(0, 2, 1),
             encoding_lengths= token_lengths,
             features= mels,
-            feature_lengths= latent_code_lengths,
+            feature_lengths= mel_lengths,
             attention_priors= attention_priors
             )
         prediction_durations = self.duration_predictor(
             encodings= encodings,
             lengths= token_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             )   # [Batch, Enc_t]
-        prediction_speakers = self.speaker_eliminator(encodings)
         
         alignments = self.Length_Regulate(durations)
         encodings = encodings @ alignments  # [Batch, Enc_d, Dec_t]
         
         encodings = self.frame_prior_network.forward(
             encodings= encodings,
-            lengths= latent_code_lengths,
+            lengths= mel_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             )   # [Batch, Enc_d, Dec_t]
         prediction_f0s = self.f0_predictor(
             encodings= encodings,
-            lengths= latent_code_lengths,
+            lengths= mel_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             )   # [Batch, Dec_t]
 
+        linear_prediction_mels = self.linear_projection(encodings)
+
         flows, prediction_flows = self.cfm(
-            encodings= encodings,
+            encodings= linear_prediction_mels,
             f0s= f0s,
-            latents= latents,
-            lengths= latent_code_lengths,
+            mels= target_mels,
+            lengths= mel_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             )
 
         return \
             flows, prediction_flows, \
+            target_mels, linear_prediction_mels, \
             durations, prediction_durations, prediction_f0s, \
             attention_softs, attention_hards, attention_logprobs, \
-            prediction_speakers, alignments
+            alignments
     
     def Inference(
         self,
         tokens: torch.LongTensor,
         token_lengths: torch.LongTensor,
-        reference_latent_codes: torch.LongTensor,
-        reference_latent_code_lengths: torch.LongTensor,
+        reference_mels: torch.LongTensor,
+        reference_mel_lengths: torch.LongTensor,
         languages: torch.LongTensor,
         cfm_steps: int= 16
         ):
-        with torch.no_grad():
-            reference_latents = self.hificodec.quantizer.embed(reference_latent_codes.mT).detach()
+        reference_mels = (reference_mels - self.mel_min) / (self.mel_max - self.mel_min) * 2.0 - 1.0
 
         prompts = self.prompt_encoder(
-            latents= reference_latents,
-            lengths= reference_latent_code_lengths,
+            mels= reference_mels,
+            lengths= reference_mel_lengths,
             )    # [Batch, Enc_d, Prompt_t]
         encodings = self.encoder(
             tokens= tokens,
             languages= languages,
             lengths= token_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             )    # [Batch, Enc_d, Enc_t]
 
         durations = self.duration_predictor(
             encodings= encodings,
             lengths= token_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             ).ceil().long()   # [Batch, Enc_t]
         alignments = self.Length_Regulate(durations)
 
         encodings = encodings @ alignments  # [Batch, Enc_d, Dec_t]
 
-        latent_code_lengths = torch.stack([
+        mel_lengths = torch.stack([
             alignment[:token_length, :].sum().long()
             for token_length, alignment in zip(token_lengths, alignments)
             ])
 
         encodings = self.frame_prior_network(
             encodings= encodings,
-            lengths= latent_code_lengths,
+            lengths= mel_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             ) # [Batch, Enc_d, Dec_t]
         f0s = self.f0_predictor(
             encodings= encodings,
-            lengths= latent_code_lengths,
+            lengths= mel_lengths,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             )   # [Batch, Dec_t]
 
-        latents = self.cfm.Inference(
-            encodings= encodings,
+        linear_prediction_mels = self.linear_projection(encodings)
+
+        mels = self.cfm.Inference(
+            encodings= linear_prediction_mels,
             f0s= f0s,
-            lengths= latent_code_lengths,
+            lengths= mel_lengths,
             steps= cfm_steps,
             prompts= prompts,
-            prompt_lengths= reference_latent_code_lengths
+            prompt_lengths= reference_mel_lengths
             )
+        
+        mels = (mels + 1.0) / 2.0 * (self.mel_max - self.mel_min) + self.mel_min
+        linear_prediction_mels = (linear_prediction_mels + 1.0) / 2.0 * (self.mel_max - self.mel_min) + self.mel_min
 
-        # Performing VQ to correct the incomplete predictions.
-        *_, latent_codes = self.hificodec.quantizer(latents)
-        latent_codes = [code.reshape(tokens.size(0), -1) for code in latent_codes]
-        latent_codes = torch.stack(latent_codes, 2)
-        audios = self.hificodec(latent_codes)[:, 0, :]
-
-        return audios, f0s, alignments
+        return mels, f0s, alignments, linear_prediction_mels
 
     def Length_Regulate(
         self,
@@ -197,10 +197,6 @@ class RectifiedFlowTTS(torch.nn.Module):
         alignments = (reps_cumsum[:, :, :-1] <= range_) & (reps_cumsum[:, :, 1:] > range_)
 
         return alignments.permute(0, 2, 1).float()
-        
-    def train(self, mode: bool= True):
-        super().train(mode= mode)
-        self.hificodec.eval()
 
 
 class Encoder(torch.nn.Module):
@@ -276,7 +272,7 @@ class Prompt_Encoder(torch.nn.Module):
         self.hp = hyper_parameters
  
         self.prenet = Conv_Init(torch.nn.Conv1d(
-            in_channels= self.hp.Audio_Codec_Size,
+            in_channels= self.hp.Sound.N_Mel,
             out_channels= self.hp.Encoder.Size,
             kernel_size= 1
             ), w_init_gain= 'gelu')
@@ -294,20 +290,20 @@ class Prompt_Encoder(torch.nn.Module):
     
     def forward(
         self,
-        latents: torch.Tensor,
+        mels: torch.Tensor,
         lengths: torch.Tensor,
         ) -> torch.Tensor:
         '''
         encodings: [Batch, Enc_d, Enc_t]        
         lengths: [Batch], token length
         '''
-        latents = self.prenet(latents)
-        latents = self.gelu(latents)
+        mels = self.prenet(mels)
+        mels = self.gelu(mels)
         
         for block in self.blocks:
-            latents = block(latents, lengths)
+            mels = block(mels, lengths)
 
-        return latents
+        return mels
 
 class Duration_Predictor(torch.nn.Module):
     def __init__(
@@ -395,7 +391,7 @@ class F0_Predictor(torch.nn.Module):
         ) -> torch.Tensor:
         '''
         encodings: [Batch, Enc_d, Dec_t]        
-        lengths: [Batch], latent length
+        lengths: [Batch], mel length
         '''
         encodings = encodings.detach()
         
@@ -494,7 +490,7 @@ class Frame_Prior_Network(torch.nn.Module):
         ) -> torch.Tensor:
         '''
         encodings: [Batch, Enc_d, Dec_t],
-        lengths: [Batch], latent length
+        lengths: [Batch], mel length
         '''
         for block in self.blocks:
             encodings = block(

@@ -3,13 +3,12 @@ import math
 from argparse import Namespace
 from typing import Optional, List, Dict, Union
 from tqdm import tqdm
+import ot
 
 from torchdiffeq import odeint
 from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalFlowMatcher
 
 from .Layer import Conv_Init, Lambda, FFT_Block, Norm_Type
-
-# https://github.com/rtqichen/torchdiffeq/blob/master/examples/ode_demo.py
 
 class CFM(torch.nn.Module):
     def __init__(
@@ -56,10 +55,13 @@ class CFM(torch.nn.Module):
             torch.rand(encodings.size(0), device= encodings.device)
             )[:, None, None]
 
-        noises = torch.randn_like(mels)  # [Batch, Mel_d, Mel_t]
+        if self.hp.CFM.Use_OT:
+            noises = self.OT_CFM_Sampling(mels)
+        else:
+            noises = torch.randn_like(mels)  # [Batch, Mel_d, Mel_t]
 
-        noised_mels = timesteps * mels + (1.0 - timesteps) * noises
-        flows = mels - noises
+        noised_mels = timesteps * mels + (1.0 - timesteps) * noises  # [Batch, Mel_d, Mel_t]
+        flows = mels - noises   # ut
 
         # predict flow
         network_outputs = self.network.forward(
@@ -130,6 +132,54 @@ class CFM(torch.nn.Module):
             )[-1]
 
         return mels
+    
+    @torch.compile
+    def OT_CFM_Sampling(
+        self,
+        mels: torch.FloatTensor,
+        reg: float= 0.05
+        ):
+        noises = torch.randn(
+            size= (mels.size(0) * self.hp.Train.OT_Noise_Multiplier, mels.size(1), mels.size(2)),
+            device= mels.device
+            )
+
+        distances = torch.cdist(
+            noises.view(noises.size(0), -1),
+            mels.view(mels.size(0), -1)
+            ).detach() ** 2.0        
+        distances = distances / distances.max() # without normalize_cost, sinkhorn is failed.
+
+        ot_maps = ot.bregman.sinkhorn_log(
+            a= torch.full(
+                (noises.size(0), ),
+                fill_value= 1.0 / noises.size(0),
+                device= noises.device
+                ),
+            b= torch.full(
+                (mels.size(0), ),
+                fill_value= 1.0 / mels.size(0),
+                device= mels.device
+                ),
+            M= distances,
+            reg= reg
+            )
+        probabilities = ot_maps / ot_maps.sum(dim= 0, keepdim= True)
+        noise_indices = torch.cat([
+            torch.multinomial(
+                probability,
+                num_samples= 1,
+                replacement= True
+                )
+            for probability in probabilities.T
+            ])
+
+        sampled_noises = noises[noise_indices]
+
+        return sampled_noises
+
+
+
 
 class Network(torch.nn.Module):
     def __init__(
@@ -283,3 +333,43 @@ def Fused_Gate(x):
     x = x_tanh.tanh() * x_sigmoid.sigmoid()
 
     return x
+
+def Calc_OT_Path(
+    noises: torch.FloatTensor,
+    mels: torch.FloatTensor,
+    use_normalize_cost: bool= False,
+    ):
+    a = torch.full(
+        (noises.size(0), ),
+        fill_value= 1.0 / noises.size(0),
+        device= noises.device
+        )
+    b = torch.full(
+        (mels.size(0), ),
+        fill_value= 1.0 / mels.size(0),
+        device= mels.device
+        )
+    noises = noises.view(noises.size(0), -1)
+    mels = mels.view(mels.size(0), -1)
+    distances = torch.cdist(noises, mels) ** 2.0  # [Batch, Batch]
+    if use_normalize_cost:
+        distances = distances / distances.max()
+
+    ot_maps = ot.bregman.sinkhorn_log(
+        a= a,
+        b= b,
+        M= distances.detach()
+        )
+    probabilities = ot_maps.flatten()
+    probabilities = probabilities / probabilities.sum()
+    choices = torch.multinomial(
+        probabilities,
+        num_samples= mels.size(0),
+        replacement= True
+        )
+
+
+    noised_mels = schedule_times * mels + (1.0 - schedule_times) * (noises @ optimal_transports.mT)
+    ot_flows = mels - noised_mels
+
+    return noised_mels, ot_flows

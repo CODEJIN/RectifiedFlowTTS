@@ -78,6 +78,7 @@ CFM:
             Stack: 2
             Dropout_Rate: 0.0
     Use_CFG: true
+    Use_OT: true
 
 
 Token_Path: '/mnt/f/Datasets/24K.RectifiedFlowTTS.VCTK.Mel/Token.yaml'
@@ -123,6 +124,7 @@ Train:
         Epsilon: 1.0e-7
     Weight_Decay: 1.0e-6
     CFG_Alpha: 0.1  # only using when Use_CFG is true
+    OT_Noise_Multiplier: 4  # only using when Use_OT is true
     Accumulated_Gradient_Step: 1 # 25    
     Gradient_Norm: 1.0
     Discriminator_Lambda: 1.0

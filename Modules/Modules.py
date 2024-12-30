@@ -122,7 +122,8 @@ class RectifiedFlowTTS(torch.nn.Module):
         reference_mels: torch.LongTensor,
         reference_mel_lengths: torch.LongTensor,
         languages: torch.LongTensor,
-        cfm_steps: int= 16
+        cfm_steps: int= 16,
+        cfg_guidance_scale: float= 4.0
         ):
         reference_mels = (reference_mels - self.mel_min) / (self.mel_max - self.mel_min) * 2.0 - 1.0
 
@@ -171,7 +172,8 @@ class RectifiedFlowTTS(torch.nn.Module):
             lengths= mel_lengths,
             steps= cfm_steps,
             prompts= prompts,
-            prompt_lengths= reference_mel_lengths
+            prompt_lengths= reference_mel_lengths,
+            cfg_guidance_scale= cfg_guidance_scale
             )
         
         mels = (mels + 1.0) / 2.0 * (self.mel_max - self.mel_min) + self.mel_min

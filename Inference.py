@@ -42,16 +42,27 @@ class Inferencer:
             gradient_accumulation_steps= self.hp.Train.Accumulated_Gradient_Step
             )
 
-        self.model = torch.optim.swa_utils.AveragedModel(RectifiedFlowTTS(self.hp).to(self.device))
+        mel_dict = yaml.load(open(self.hp.Mel_Info_Path, encoding= 'utf-8-sig'), Loader=yaml.Loader)
+        mel_min, mel_max = zip(*[(x['Min'], x['Max']) for x in mel_dict.values()])
+        mel_min, mel_max = min(mel_min), max(mel_max)
+
+        self.model = torch.optim.swa_utils.AveragedModel(RectifiedFlowTTS(
+            self.hp,
+            mel_min= mel_min,
+            mel_max= mel_max,
+            ).to(self.device))
         self.model.Inference = self.model.module.Inference
         self.accelerator.prepare(self.model)
 
-        self.Load_Checkpoint(checkpoint_path)
+        self.vocoder = torch.jit.load('BigVGAN_24K_100band_256x.pts', map_location= 'cpu').to(self.device)
+
+        # self.Load_Checkpoint(checkpoint_path)
         self.batch_size = batch_size
 
     def Dataset_Generate(
         self,
         texts: List[str],
+        reference_paths: List[str],
         languages: List[str],
         ):
         token_dict = yaml.load(open(self.hp.Token_Path, encoding= 'utf-8-sig'), Loader=yaml.Loader)
@@ -60,8 +71,12 @@ class Inferencer:
         dataset = Dataset(
             token_dict= token_dict,
             language_dict= language_dict,
+            sample_rate= self.hp.Sound.Sample_Rate,
+            hop_size= self.hp.Sound.Hop_Size,
+            n_mels= self.hp.Sound.N_Mel,
             use_between_padding= self.hp.Use_Between_Padding,
             texts= texts,
+            reference_paths= reference_paths,
             languages= languages,
             )
         collater = Collater(
@@ -88,44 +103,46 @@ class Inferencer:
         self,
         tokens: torch.IntTensor,
         token_lengths: torch.IntTensor,
-        languages: torch.IntTensor
+        reference_mels: torch.FloatTensor,
+        reference_mel_lengths: torch.IntTensor,
+        languages: torch.IntTensor,
+        cfg_guidance_scale: float= 4.0
         ):
-        prediction_audios, _, prediction_alignments = self.model.Inference(
+        prediction_mels, _, prediction_alignments, _ = self.model.Inference(
             tokens= tokens.to(self.device),
             token_lengths= token_lengths.to(self.device),
+            reference_mels= reference_mels.to(self.device),
+            reference_mel_lengths= reference_mel_lengths.to(self.device),
             languages= languages.to(self.device),
+            cfg_guidance_scale= cfg_guidance_scale
             )
         
-        latent_code_lengths = [
+        mel_lengths = [
             alignment[:token_length, :].sum().long().item()
             for token_length, alignment in zip(token_lengths, prediction_alignments)
             ]
         audio_lengths = [
             length * self.hp.Sound.Hop_Size
-            for length in latent_code_lengths
+            for length in mel_lengths
             ]
-
         prediction_audios = [
             audio[:length]
-            for audio, length in zip(prediction_audios.clamp(-1.0, 1.0).cpu().numpy(), audio_lengths)
+            for audio, length in zip(self.vocoder(prediction_mels).clamp(-1.0, 1.0).cpu().numpy(), audio_lengths)
             ]
-        
-        print(token_lengths)
-        print(latent_code_lengths)
-        print(audio_lengths)
-        print(prediction_alignments.shape)
-        print(prediction_alignments[0])
 
         return prediction_audios
 
     def Inference_Epoch(
         self,
         texts: List[str],
+        reference_paths: List[str],
         languages: List[str],
+        cfg_guidance_scale: float= 4.0,
         use_tqdm= True
         ):
         dataloader = self.Dataset_Generate(
             texts= texts,
+            reference_paths= reference_paths,
             languages= languages
             )
         if use_tqdm:
@@ -135,14 +152,21 @@ class Inferencer:
                 total= math.ceil(len(dataloader.dataset) / self.batch_size)
                 )
         audios = []
-        for tokens, token_lengths, languages, _, _ in dataloader:
-            audios.extend(self.Inference_Step(tokens, token_lengths, languages))
+        for tokens, token_lengths, reference_mels, reference_mel_lengths, languages, _, _ in dataloader:
+            audios.extend(self.Inference_Step(
+                tokens= tokens,
+                token_lengths= token_lengths,
+                reference_mels= reference_mels,
+                reference_mel_lengths= reference_mel_lengths,
+                languages= languages,
+                cfg_guidance_scale= cfg_guidance_scale
+                ))
         
         return audios
     
 if __name__ == '__main__':
     inferencer = Inferencer(
-        hp_path= './results/Checkpoint/Hyper_Parameters.yaml',
+        hp_path= 'Hyper_Parameters.yaml',
         checkpoint_path= './results/Checkpoint/S_166424',
         batch_size= 4
         )
@@ -154,6 +178,13 @@ if __name__ == '__main__':
             'A good medicine tastes bitter.',
             'Do not count your chickens before they hatch.',
             'If you laugh, blessings will come your way.'
+            ],
+        reference_paths= [
+            '/mnt/f/Rawdata/VCTK092/wav48/p225/p225_001_mic1.flac',
+            '/mnt/f/Rawdata/VCTK092/wav48/p264/p264_002_mic1.flac',
+            '/mnt/f/Rawdata/VCTK092/wav48/p271/p271_002_mic2.flac',
+            '/mnt/f/Rawdata/LJSpeech/wavs/LJ032-0206.wav',
+            '/mnt/f/Rawdata/LJSpeech/wavs/LJ010-0106.wav',
             ],
         languages= [
             'English',
@@ -167,5 +198,5 @@ if __name__ == '__main__':
     from scipy.io import wavfile
     for index, audio in enumerate(audios):
         wavfile.write(
-            f'{index}.wav', inferencer.hp.Sound.Sample_Rate, audio
+            f'{index:05d}.wav', inferencer.hp.Sound.Sample_Rate, audio
             )
